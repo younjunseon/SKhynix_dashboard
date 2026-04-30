@@ -12,27 +12,31 @@ interface Props {
 
 export default function PageHeader({ title, subtitle, split, onSplitChange, right }: Props) {
   return (
-    <div className="flex items-end justify-between mb-2 px-1">
+    <div className="flex items-end justify-between mb-5">
       <div>
-        <h1 className="text-[16px] font-bold text-black leading-tight">{title}</h1>
-        {subtitle && <p className="text-[11px] text-slate-700 mt-0.5">{subtitle}</p>}
+        <h1 className="text-[20px] font-bold text-brand-text leading-tight">{title}</h1>
+        {subtitle && <p className="text-[12px] text-brand-textMuted mt-1">{subtitle}</p>}
       </div>
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-3">
         {right}
         {split && onSplitChange && (
-          <div className="flex items-center gap-1">
-            <span className="text-[11px] text-slate-700">Split:</span>
-            <select
-              value={split}
-              onChange={(e) => onSplitChange(e.target.value as Split)}
-              className="border border-slate-500 bg-white text-[11px] px-1 py-0.5"
-            >
+          <div className="flex items-center gap-2">
+            <span className="text-[12px] text-brand-textMuted">Split</span>
+            <div className="inline-flex bg-white border border-brand-border rounded-lg overflow-hidden shadow-card">
               {SPLITS.map((sp) => (
-                <option key={sp} value={sp}>
+                <button
+                  key={sp}
+                  onClick={() => onSplitChange(sp)}
+                  className={`text-[12px] px-3 py-1.5 font-medium transition-colors ${
+                    split === sp
+                      ? "bg-brand-primary text-white"
+                      : "text-brand-textMuted hover:bg-brand-subtle"
+                  }`}
+                >
                   {sp}
-                </option>
+                </button>
               ))}
-            </select>
+            </div>
           </div>
         )}
       </div>

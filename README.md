@@ -3,7 +3,19 @@
 SK Hynix Wafer Test 기반 Field Health(RCC) 예측 결과를 시각화하는 인터랙티브 대시보드.
 
 - **백엔드**: FastAPI + pandas (port 8765)
-- **프론트엔드**: React + Vite + Recharts (port 5173)
+- **프론트엔드**: React + Vite + Recharts + TailwindCSS (port 5173)
+
+## 페이지 구성
+
+| 페이지 | 내용 |
+|---|---|
+| **Overview** | KPI(예측 불량률·평균 health), 기간별 완료수량+불량률 듀얼축 차트(일/주/월), Top 10 위험 wafer/unit, 예측 분포 히스토그램 |
+| **Wafer Map** | wafer 리스트 → die 단위 히트맵 → unit 진단 리포트 (3-pane drill-down) |
+| **Data** | unit 데이터 테이블 — split 필터, 검색, 정렬, CSV 다운로드 |
+
+전역 UI:
+- **우상단 알람 벨** — 신규 위험 wafer/unit 알림, 클릭 시 해당 페이지로 이동
+- **우하단 챗봇** — 자연어 질의 AI Agent (현재 mock, 추후 LLM 연동 예정)
 
 ## 사전 요구사항
 

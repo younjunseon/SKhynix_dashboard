@@ -2,7 +2,7 @@ import { BrowserRouter, Route, Routes } from "react-router-dom";
 import Layout from "./components/Layout";
 import Overview from "./pages/Overview";
 import Wafers from "./pages/Wafers";
-import Lots from "./pages/Lots";
+import Data from "./pages/Data";
 
 export default function App() {
   return (
@@ -11,7 +11,7 @@ export default function App() {
         <Route element={<Layout />}>
           <Route index element={<Overview />} />
           <Route path="wafers" element={<Wafers />} />
-          <Route path="lots" element={<Lots />} />
+          <Route path="data" element={<Data />} />
         </Route>
       </Routes>
     </BrowserRouter>

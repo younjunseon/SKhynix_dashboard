@@ -60,7 +60,7 @@ export default function Wafers() {
         onSplitChange={setSplit}
       />
 
-      <div className="grid grid-cols-12 gap-2">
+      <div className="grid grid-cols-12 gap-4">
         {/* 좌: wafer 목록 */}
         <div className="col-span-3">
           <Panel title="Wafers (sorted by risk_ratio)" bodyClassName="p-0">
