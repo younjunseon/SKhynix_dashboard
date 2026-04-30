@@ -1,0 +1,114 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: "Segoe UI", Tahoma, "Malgun Gothic", sans-serif;
+  background: #d4d0c8;
+  color: #000;
+  font-size: 12px;
+  -webkit-font-smoothing: subpixel-antialiased;
+}
+
+/* Spotfire 패널 */
+.panel {
+  background: #fff;
+  border: 1px solid #808080;
+}
+.panel-title {
+  background: linear-gradient(to bottom, #4a5b6c 0%, #2c3845 100%);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 4px 8px;
+  border-bottom: 1px solid #1a2530;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.panel-body {
+  padding: 8px;
+  background: #fff;
+}
+
+/* 표 */
+table.spotfire {
+  font-size: 11px;
+  border-collapse: collapse;
+  width: 100%;
+}
+table.spotfire th {
+  background: #ece9d8;
+  border: 1px solid #aca899;
+  padding: 3px 6px;
+  font-weight: 600;
+  text-align: left;
+  font-size: 10px;
+  color: #333;
+}
+table.spotfire td {
+  border: 1px solid #d4d0c8;
+  padding: 2px 6px;
+  font-size: 11px;
+}
+table.spotfire tr:hover td {
+  background: #fffbe6;
+}
+table.spotfire tr.active td {
+  background: #316ac5;
+  color: #fff;
+}
+
+/* 버튼 */
+.btn {
+  border: 1px solid #707070;
+  background: linear-gradient(to bottom, #f6f6f6, #d8d8d8);
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.btn:hover { background: linear-gradient(to bottom, #fff, #e8e8e8); }
+.btn:active { background: #c8c8c8; }
+.btn.btn-primary {
+  background: linear-gradient(to bottom, #4a8edb, #2563b0);
+  color: #fff;
+  border-color: #1e4d8b;
+}
+
+/* 셀렉트/탭 */
+.tab-bar {
+  background: #ece9d8;
+  border-bottom: 1px solid #808080;
+  display: flex;
+  padding: 2px 4px 0 4px;
+}
+.tab {
+  font-size: 11px;
+  padding: 3px 12px;
+  border: 1px solid #808080;
+  border-bottom: none;
+  background: #d4d0c8;
+  cursor: pointer;
+  margin-right: 2px;
+  border-radius: 2px 2px 0 0;
+}
+.tab.active {
+  background: #fff;
+  border-bottom: 1px solid #fff;
+  position: relative;
+  top: 1px;
+  font-weight: 600;
+}
+
+/* 스크롤바 */
+::-webkit-scrollbar { width: 16px; height: 16px; }
+::-webkit-scrollbar-track { background: #f0f0f0; border: 1px solid #c0c0c0; }
+::-webkit-scrollbar-thumb { background: linear-gradient(to right, #d8d8d8, #b0b0b0); border: 1px solid #808080; }
+::-webkit-scrollbar-thumb:hover { background: linear-gradient(to right, #e0e0e0, #c0c0c0); }
+
+.tabular { font-variant-numeric: tabular-nums; }
