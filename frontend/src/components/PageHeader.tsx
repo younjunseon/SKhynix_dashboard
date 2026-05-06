@@ -2,8 +2,6 @@ import type { StatusFilter } from "../lib/api";
 
 const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
   { value: "today", label: "오늘" },
-  { value: "pending", label: "대기" },
-  { value: "completed", label: "완료" },
   { value: "all", label: "전체" },
 ];
 

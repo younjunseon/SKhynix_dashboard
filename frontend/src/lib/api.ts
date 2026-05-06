@@ -71,6 +71,8 @@ export interface DieItem {
   status?: Status;
 }
 
+
+
 export const fetchOverview = () =>
   api.get<Overview>("/api/overview").then((r) => r.data);
 
@@ -331,6 +333,38 @@ export interface PsiItem {
 export const fetchPsi = (top = 10) =>
   api
     .get<{ items: PsiItem[] }>("/api/model/psi", { params: { top } })
+    .then((r) => r.data);
+
+export interface FeatureCorrItem {
+  feature: string;
+  r: number;
+  abs_r: number;
+}
+
+export interface ShapItem {
+  feature: string;
+  shap: number;
+  abs_shap: number;
+  total_gain: number;
+  cohens_d: number;
+  mean_risk: number;
+  mean_norm: number;
+}
+
+export const fetchShap = (top = 10) =>
+  api
+    .get<{ items: ShapItem[]; n_total: number; max_abs_shap: number }>(
+      "/api/model/shap",
+      { params: { top } },
+    )
+    .then((r) => r.data);
+
+export const fetchFeatureCorr = (top = 10) =>
+  api
+    .get<{ items: FeatureCorrItem[]; n_total: number; max_abs_r: number }>(
+      "/api/model/feature-corr",
+      { params: { top } },
+    )
     .then((r) => r.data);
 
 export interface VarCompareItem {

@@ -6,19 +6,21 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link } from "react-router-dom";
 import {
   Bar,
   BarChart,
   CartesianGrid,
+  Cell,
   Legend,
+  Line,
+  LineChart,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
 } from "recharts";
 import {
-  fetchGlobalAnomalyFeatures,
   fetchLots,
   fetchOverview,
   fetchTriage,
@@ -26,11 +28,9 @@ import {
   type StatusFilter,
   type UnitItem,
 } from "../lib/api";
-import KpiCard from "../components/KpiCard";
 import PageHeader from "../components/PageHeader";
 import Panel from "../components/Panel";
-import StatChip from "../components/StatChip";
-import { fmtInt, fmtNum, fmtPct, fmtPpm, healthToPpm, TIERS, tierOfHealth } from "../lib/format";
+import { fmtInt, fmtPpm, healthToPpm, TIERS, tierOfHealth } from "../lib/format";
 import {
   BAR_RADIUS,
   CHART_COLORS,
@@ -135,11 +135,84 @@ function buildTrend(units: UnitItem[], g: Granularity, status: StatusFilter): Tr
   return arr;
 }
 
+/** 최근 7일 (today-6 ~ today) 일별 평균 ppm 버킷 — KPI 직하 차트용 */
+function buildTrend7d(units: UnitItem[]): { label: string; date: string; meanPredPpm: number; totalCount: number; isToday: boolean }[] {
+  const todayMs = startOfToday().getTime();
+  const day = 86_400_000;
+  const dayNames = ["일", "월", "화", "수", "목", "금", "토"];
+  const buckets = Array.from({ length: 7 }, (_, i) => {
+    const offset = i - 6; // -6, -5, ..., 0
+    const t = todayMs + offset * day;
+    const d = new Date(t);
+    return {
+      ms: t,
+      iso: d.toISOString().slice(0, 10),
+      label: `${d.getMonth() + 1}/${d.getDate()} (${dayNames[d.getDay()]})`,
+      meanPredPpm: 0,
+      totalCount: 0,
+      sum: 0,
+      isToday: offset === 0,
+    };
+  });
+  for (const u of units) {
+    if (!u.inspected_date) continue;
+    const insp = new Date(u.inspected_date);
+    insp.setHours(0, 0, 0, 0);
+    const t = insp.getTime();
+    const offset = Math.round((t - todayMs) / day);
+    if (offset < -6 || offset > 0) continue;
+    const idx = offset + 6;
+    buckets[idx].totalCount += 1;
+    buckets[idx].sum += u.pred;
+  }
+  return buckets.map((b) => ({
+    label: b.label,
+    date: b.iso,
+    meanPredPpm: b.totalCount > 0 ? (b.sum / b.totalCount) * 1_000_000 : 0,
+    totalCount: b.totalCount,
+    isToday: b.isToday,
+  }));
+}
+
 /* ─── 오늘 모드: 어제 비교 ─────────────────── */
 interface DayCompare {
   count: number;
   meanPredPpm: number;
   riskCount: number;
+}
+
+interface WeekCompare {
+  thisWeek: { count: number; meanPredPpm: number };
+  lastWeek: { count: number; meanPredPpm: number };
+}
+
+/** 이번주(오늘 포함 최근 7일) vs 지난주(그 직전 7일) 평균 ppm 비교 */
+function buildWeekCompare(units: UnitItem[]): WeekCompare {
+  const todayMs = startOfToday().getTime();
+  const day = 86_400_000;
+  // 이번주 = today-6 ~ today (7일)
+  // 지난주 = today-13 ~ today-7 (7일)
+  const thisStart = todayMs - 6 * day;
+  const lastStart = todayMs - 13 * day;
+  const lastEnd = todayMs - 7 * day;
+  let tCount = 0, tSum = 0, lCount = 0, lSum = 0;
+  for (const u of units) {
+    if (!u.inspected_date) continue;
+    const insp = new Date(u.inspected_date);
+    insp.setHours(0, 0, 0, 0);
+    const t = insp.getTime();
+    if (t >= thisStart && t <= todayMs) {
+      tCount += 1;
+      tSum += u.pred;
+    } else if (t >= lastStart && t <= lastEnd) {
+      lCount += 1;
+      lSum += u.pred;
+    }
+  }
+  return {
+    thisWeek: { count: tCount, meanPredPpm: tCount > 0 ? (tSum / tCount) * 1_000_000 : 0 },
+    lastWeek: { count: lCount, meanPredPpm: lCount > 0 ? (lSum / lCount) * 1_000_000 : 0 },
+  };
 }
 
 /** 오늘 vs 어제 비교 (count, 평균 ppm, 위험 unit 수) */
@@ -175,106 +248,8 @@ function buildDayCompare(units: UnitItem[]): { today: DayCompare; yesterday: Day
  * health=0 (정상)은 별도 카운트로 분리하고, ppm > 0인 unit만
  * log10(ppm) 기준 bin에 분배. zero가 70% 이상이라 같은 축에 두면 압도됨.
  */
-interface PpmBucket {
-  /** bin 라벨 (예: "1~10 ppm") */
-  range: string;
-  count: number;
-  /** bin 중심 ppm (정렬용) */
-  rangeStart: number;
-}
-function buildPpmHist(units: UnitItem[]): { zero: number; bins: PpmBucket[] } {
-  // 실제 pred ppm 범위(0~4,140)에 맞춘 500ppm 균등 bin
-  const decades = [
-    { from: 0, to: 500, label: "<500 ppm" },
-    { from: 500, to: 1_000, label: "500~1k ppm" },
-    { from: 1_000, to: 1_500, label: "1k~1.5k ppm" },
-    { from: 1_500, to: 2_000, label: "1.5k~2k ppm" },
-    { from: 2_000, to: 2_500, label: "2k~2.5k ppm" },
-    { from: 2_500, to: 3_000, label: "2.5k~3k ppm" },
-    { from: 3_000, to: 3_500, label: "3k~3.5k ppm" },
-    { from: 3_500, to: 4_000, label: "3.5k~4k ppm" },
-    { from: 4_000, to: Infinity, label: "4k+ ppm" },
-  ];
-  const counts = new Array(decades.length).fill(0);
-  let zero = 0;
-  for (const u of units) {
-    const ppm = Math.max(0, u.pred) * 1_000_000;
-    if (ppm <= 0) {
-      zero += 1;
-      continue;
-    }
-    const idx = decades.findIndex((d) => ppm >= d.from && ppm < d.to);
-    counts[idx >= 0 ? idx : decades.length - 1] += 1;
-  }
-  return {
-    zero,
-    bins: decades.map((d, i) => ({
-      range: d.label,
-      rangeStart: d.from,
-      count: counts[i],
-    })),
-  };
-}
-
-/* ─── Tier(S/A/B/C/D) 분포 ─────────────────────────────────── */
-interface TierCount {
-  tier: string;
-  count: number;
-  ratio: number;
-  color: string;
-}
-function buildTierDist(units: UnitItem[]): TierCount[] {
-  const counts: Record<string, number> = { A: 0, B: 0, C: 0, D: 0 };
-  for (const u of units) counts[tierOfHealth(u.pred)] += 1;
-  const total = units.length || 1;
-  return TIERS.map((t) => ({
-    tier: t.tier,
-    count: counts[t.tier] ?? 0,
-    ratio: (counts[t.tier] ?? 0) / total,
-    color: t.color,
-  }));
-}
-
-/* ─── 스크리닝 시뮬레이션 ──────────────────────────────────
- * 임계 ppm 이상 unit을 차단했을 때 통과 fleet의 평균 ppm 변화 등.
- */
-interface ScreenSim {
-  blocked: number;
-  passed: number;
-  blockRatio: number;
-  meanPpmAll: number;
-  meanPpmPassed: number;
-  ppmReduction: number;
-}
-function simulateScreening(units: UnitItem[], thresholdPpm: number): ScreenSim {
-  if (units.length === 0) {
-    return {
-      blocked: 0,
-      passed: 0,
-      blockRatio: 0,
-      meanPpmAll: 0,
-      meanPpmPassed: 0,
-      ppmReduction: 0,
-    };
-  }
-  const ppms = units.map((u) => Math.max(0, u.pred) * 1_000_000);
-  const meanAll = ppms.reduce((a, b) => a + b, 0) / ppms.length;
-  const passed = ppms.filter((p) => p <= thresholdPpm);
-  const meanPassed =
-    passed.length > 0 ? passed.reduce((a, b) => a + b, 0) / passed.length : 0;
-  const blocked = ppms.length - passed.length;
-  return {
-    blocked,
-    passed: passed.length,
-    blockRatio: blocked / ppms.length,
-    meanPpmAll: meanAll,
-    meanPpmPassed: meanPassed,
-    ppmReduction: meanAll - meanPassed,
-  };
-}
-
 export default function Overview() {
-  const [status, setStatus] = useState<StatusFilter>("today");
+  const status: StatusFilter = "today";
   const [granularity, setGranularity] = useState<Granularity>("day");
   // 시계열 막대 클릭 시 그 날짜의 상세를 모달로 표시
   const [selectedDateLabel, setSelectedDateLabel] = useState<string | null>(null);
@@ -292,24 +267,13 @@ export default function Overview() {
     queryKey: ["alert-lots", status],
     queryFn: () => fetchLots({ status, sort: "risk_ratio", limit: 5 }),
   });
-  const globalAnomalyQ = useQuery({
-    queryKey: ["overview-global-anomaly", status],
-    queryFn: () => fetchGlobalAnomalyFeatures({ status, top_n: 10 }),
-  });
-
-  // 스크리닝 시뮬레이터 임계값 (ppm). 실제 pred 분포 0~4,140 기준 p75(3,200)
-  const [screenThresholdPpm, setScreenThresholdPpm] = useState(3_200);
-
-  const filteredUnits = useMemo(() => {
-    if (!allUnitsQ.data) return [];
-    return status === "all"
-      ? allUnitsQ.data.items
-      : allUnitsQ.data.items.filter((u) => u.status === status);
-  }, [allUnitsQ.data, status]);
-
   const trend = useMemo(
     () => (allUnitsQ.data ? buildTrend(allUnitsQ.data.items, granularity, status) : []),
     [allUnitsQ.data, granularity, status]
+  );
+  const trend7d = useMemo(
+    () => (allUnitsQ.data ? buildTrend7d(allUnitsQ.data.items) : []),
+    [allUnitsQ.data]
   );
   // 오늘 unit 중 평균 pred 가장 높은 lot / wafer 산출 (요약 문장용)
   const todayTop = useMemo(() => {
@@ -345,11 +309,9 @@ export default function Overview() {
     () => (allUnitsQ.data ? buildDayCompare(allUnitsQ.data.items) : { today: { count: 0, meanPredPpm: 0, riskCount: 0 }, yesterday: { count: 0, meanPredPpm: 0, riskCount: 0 } }),
     [allUnitsQ.data]
   );
-  const ppmHist = useMemo(() => buildPpmHist(filteredUnits), [filteredUnits]);
-  const tierDist = useMemo(() => buildTierDist(filteredUnits), [filteredUnits]);
-  const screenSim = useMemo(
-    () => simulateScreening(filteredUnits, screenThresholdPpm),
-    [filteredUnits, screenThresholdPpm]
+  const weekCompare = useMemo(
+    () => (allUnitsQ.data ? buildWeekCompare(allUnitsQ.data.items) : { thisWeek: { count: 0, meanPredPpm: 0 }, lastWeek: { count: 0, meanPredPpm: 0 } }),
+    [allUnitsQ.data]
   );
 
   if (triageQ.isLoading || overviewQ.isLoading)
@@ -363,133 +325,233 @@ export default function Overview() {
 
   const todayStats = overviewQ.data.statuses.today;
   const t = triageQ.data.summary;
-  const meanPred = (() => {
-    if (status === "all") {
-      const arr = Object.values(overviewQ.data.statuses);
-      const total = arr.reduce((a, s) => a + s.n_units, 0);
-      return total > 0 ? arr.reduce((a, s) => a + s.pred_mean * s.n_units, 0) / total : 0;
-    }
-    return overviewQ.data.statuses[status]?.pred_mean ?? 0;
-  })();
+  const meanPred = overviewQ.data.statuses[status]?.pred_mean ?? 0;
   const baseline = lotsQ.data?.baseline_risk_ratio ?? t.risk_ratio;
   const dangerLots = (lotsQ.data?.items ?? []).filter((l) => l.risk_ratio > baseline * 1.5);
 
   return (
     <div>
-      <PageHeader
-        title="Overview"
-        status={status}
-        onStatusChange={setStatus}
-      />
+      <PageHeader title="Overview" />
 
-      {/* KPI 4종 — 어제 대비 증감 chip 포함 (dayCompare 기반) */}
+      {/* KPI 3종 — 큰 사이즈 (평균 ppm / 주 비교 / 위험 unit 수) */}
       {(() => {
-        const buildChange = (today: number, yesterday: number) => {
-          if (yesterday === 0 && today === 0) return undefined;
-          const diff = today - yesterday;
-          const pct = yesterday > 0 ? (diff / yesterday) * 100 : null;
-          const direction: "up" | "down" | "flat" = diff > 0 ? "up" : diff < 0 ? "down" : "flat";
-          const label =
-            pct === null
-              ? `어제 ${fmtInt(yesterday)}`
-              : `어제 대비 ${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%`;
-          return { label, direction, higherIsBad: true };
+        const fmtDelta = (cur: number, prev: number, decimals = 0) => {
+          const diff = cur - prev;
+          const sign = diff > 0 ? "▲" : diff < 0 ? "▼" : "≈";
+          const abs = Math.abs(diff).toFixed(decimals);
+          return { sign, abs, diff };
         };
+        const meanPpmDelta = fmtDelta(dayCompare.today.meanPredPpm, dayCompare.yesterday.meanPredPpm, 0);
+        const weekDelta = fmtDelta(weekCompare.thisWeek.meanPredPpm, weekCompare.lastWeek.meanPredPpm, 0);
+        const riskDelta = fmtDelta(dayCompare.today.riskCount, dayCompare.yesterday.riskCount, 0);
+        // 색상: 증가가 나쁜 지표 (ppm/위험)
+        const deltaColor = (diff: number) =>
+          diff > 0 ? "#dc2626" : diff < 0 ? "#15803d" : "#64748b";
+        const cardCls =
+          "panel relative overflow-hidden px-6 py-5 flex flex-col justify-between min-h-[160px]";
+        const labelCls =
+          "text-[13px] font-semibold text-brand-textMuted uppercase tracking-wider";
+        const valueCls = "tabular text-[44px] font-bold leading-none mt-2";
         return (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 mb-4 sm:mb-5">
-            <KpiCard
-              label="오늘 검사 unit"
-              value={fmtInt(dayCompare.today.count)}
-              hint="실시간 진단 대상"
-              tone="warn"
-              accentBar="#f59e0b"
-              change={(() => {
-                const c = buildChange(dayCompare.today.count, dayCompare.yesterday.count);
-                return c ? { ...c, higherIsBad: false } : undefined; // 검사량 증가는 좋음
-              })()}
-            />
-            <KpiCard
-              label="오늘 평균 예측 ppm"
-              value={fmtPpm(dayCompare.today.meanPredPpm)}
-              hint="오늘 검사 unit 평균"
-              tone="info"
-              change={buildChange(dayCompare.today.meanPredPpm, dayCompare.yesterday.meanPredPpm)}
-            />
-            <KpiCard
-              label="p95 ppm"
-              value={fmtPpm(healthToPpm(triageQ.data.scale.risk_threshold))}
-              hint="상위 5% 꼬리 위험 수준"
-              tone="warn"
-            />
-            <KpiCard
-              label="오늘 위험 unit"
-              value={fmtInt(dayCompare.today.riskCount)}
-              hint={`pred > p95 (오늘 ${fmtInt(dayCompare.today.count)} 중)`}
-              tone="danger"
-              change={buildChange(dayCompare.today.riskCount, dayCompare.yesterday.riskCount)}
-            />
-          </div>
-        );
-      })()}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 sm:gap-4 mb-4 sm:mb-5">
+            {/* 1. 처리 유닛 수 (오늘) */}
+            <div className={cardCls} style={{ borderLeft: "4px solid #2563eb" }}>
+              <div>
+                <div className={labelCls}>오늘 처리 유닛 수</div>
+                <div className={valueCls} style={{ color: "#2563eb" }}>
+                  {fmtInt(dayCompare.today.count)}
+                </div>
+              </div>
+            </div>
 
-      {/* 오늘 자연어 요약 — 한눈에 상황 파악 */}
-      {dayCompare.today.count > 0 && (() => {
-        const thresholdRate = dayCompare.today.count > 0
-          ? (dayCompare.today.riskCount / dayCompare.today.count) * 100
-          : 0;
-        return (
-          <div className="mb-4 sm:mb-5 bg-blue-50 border-l-4 border-brand-primary rounded-md px-4 py-3">
-            <div className="text-[12px] text-brand-text leading-relaxed">
-              오늘 검사된 <strong className="text-brand-primary">{fmtInt(dayCompare.today.count)}</strong>개 Unit 중{" "}
-              <strong className="text-brand-danger">{thresholdRate.toFixed(1)}%</strong>가 임계값을 초과했습니다.
-              {(todayTop.topLot || todayTop.topWafer) && (
-                <>
-                  {" "}위험도는{" "}
-                  {todayTop.topLot && <strong className="font-mono">{todayTop.topLot}</strong>}
-                  {todayTop.topLot && " Lot, "}
-                  {todayTop.topWafer && <strong className="font-mono">{todayTop.topWafer}</strong>}
-                  {todayTop.topWafer && " Wafer"}
-                  에서 상대적으로 높게 나타났으며, 상위 위험 Unit을 우선 확인할 필요가 있습니다.
-                </>
-              )}
+            {/* 2. 오늘 평균 / 일주일 평균 ppm — 한 카드에 두 줄 */}
+            <div className={cardCls} style={{ borderLeft: "4px solid #f59e0b" }}>
+              <div>
+                <div className={labelCls}>평균 예측 ppm</div>
+                <div className="flex items-baseline gap-3 mt-2">
+                  <div className="tabular text-[40px] font-bold leading-none" style={{ color: "#b45309" }}>
+                    {fmtPpm(dayCompare.today.meanPredPpm)}
+                  </div>
+                  <div className="text-[12px] text-brand-textMuted font-medium">오늘</div>
+                </div>
+                <div className="flex items-baseline gap-3 mt-2">
+                  <div className="tabular text-[24px] font-semibold leading-none" style={{ color: "#b45309" }}>
+                    {fmtPpm(weekCompare.thisWeek.meanPredPpm)}
+                  </div>
+                  <div className="text-[12px] text-brand-textMuted font-medium">일주일 평균</div>
+                </div>
+              </div>
+              <div className="flex flex-col gap-1 mt-3 text-[12px]">
+                <div className="flex items-center gap-2">
+                  <span style={{ color: deltaColor(meanPpmDelta.diff) }} className="font-semibold tabular">
+                    {meanPpmDelta.sign} {fmtPpm(Number(meanPpmDelta.abs))}
+                  </span>
+                  <span className="text-brand-textMuted">어제 대비</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span style={{ color: deltaColor(weekDelta.diff) }} className="font-semibold tabular">
+                    {weekDelta.sign} {fmtPpm(Number(weekDelta.abs))}
+                  </span>
+                  <span className="text-brand-textMuted">지난주 대비</span>
+                </div>
+              </div>
+            </div>
+
+            {/* 3. 위험 유닛 수 (오늘) */}
+            <div className={cardCls} style={{ borderLeft: "4px solid #dc2626" }}>
+              <div>
+                <div className={labelCls}>오늘 위험 유닛 수</div>
+                <div className={valueCls} style={{ color: "#dc2626" }}>
+                  {fmtInt(dayCompare.today.riskCount)}
+                </div>
+              </div>
+              <div className="flex items-center gap-2 mt-3 text-[13px]">
+                <span style={{ color: deltaColor(riskDelta.diff) }} className="font-semibold">
+                  {riskDelta.sign} {riskDelta.abs}
+                </span>
+                <span className="text-brand-textMuted">어제 대비</span>
+              </div>
             </div>
           </div>
         );
       })()}
 
-      {/* Alert 영역 */}
-      {dangerLots.length > 0 && (
-        <Panel title="위험 lot 알림" className="mb-4 sm:mb-5">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-[11px] text-brand-textMuted">
-              평균 위험률 {fmtPct(baseline)} 대비 1.5배 이상:
-            </span>
-            {dangerLots.map((l) => (
-              <Link
-                key={l.run_id}
-                to={`/drilldown`}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-50 text-amber-800 text-[11px] font-semibold hover:bg-amber-100 transition-colors"
-                title={`위험 ${l.n_risk}/${l.n_units} unit · 전체 모집단 ${l.n_units}`}
-              >
-                <span className="font-mono">{l.run_id}</span>
-                <span className="tabular">{fmtPct(l.risk_ratio)}</span>
-                <span className="tabular text-amber-600 font-normal">({l.n_risk}/{l.n_units})</span>
-              </Link>
-            ))}
-          </div>
-        </Panel>
-      )}
+      {/* 최근 7일 평균 ppm — KPI 직하, 오늘 빨강 강조 + Y축 분포 구간 줌 */}
+      {trend7d.length > 0 && (() => {
+        const nonZeroVals = trend7d.map((d) => d.meanPredPpm).filter((v) => v > 0);
+        // Y축 줌: min/max 기준 5% 여유. 데이터 없으면 fallback
+        const minV = nonZeroVals.length > 0 ? Math.min(...nonZeroVals) : 0;
+        const maxV = nonZeroVals.length > 0 ? Math.max(...nonZeroVals) : 1;
+        const span = Math.max(maxV - minV, maxV * 0.05, 1);
+        const yMin = Math.max(0, minV - span * 0.4);
+        const yMax = maxV + span * 0.25;
+        const threshold = triageQ.data ? healthToPpm(triageQ.data.scale.risk_threshold) : null;
+        const TODAY_COLOR = "#f59e0b";
+        return (
+          <Panel
+            title="최근 7일 평균 ppm"
+            right={
+              <div className="flex items-center gap-3 text-[11px]">
+                <span className="inline-flex items-center gap-1">
+                  <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: CHART_COLORS.primary }} />
+                  <span className="text-brand-textMuted">최근 6일</span>
+                </span>
+                <span className="inline-flex items-center gap-1">
+                  <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: TODAY_COLOR }} />
+                  <span className="font-semibold" style={{ color: TODAY_COLOR }}>오늘</span>
+                </span>
+              </div>
+            }
+            className="mb-4 sm:mb-5"
+          >
+            <div style={chartBox(220)}>
+              <ResponsiveContainer>
+                <LineChart data={trend7d} margin={{ top: 20, right: 20, left: 0, bottom: 0 }}>
+                  <CartesianGrid {...CHART_GRID} />
+                  <XAxis dataKey="label" tick={CHART_TICK} padding={{ left: 20, right: 20 }} />
+                  <YAxis
+                    tick={CHART_TICK}
+                    domain={[yMin, yMax]}
+                    tickFormatter={(v) => `${Math.round(v).toLocaleString()}`}
+                    label={{ value: "ppm", angle: -90, position: "insideLeft", fontSize: 11, fill: "#64748b" }}
+                  />
+                  <Tooltip
+                    contentStyle={CHART_TOOLTIP_STYLE}
+                    formatter={(value: any, _name: any, props: any) => {
+                      const ppm = `${Math.round(Number(value)).toLocaleString()} ppm`;
+                      const total = props?.payload?.totalCount ?? 0;
+                      const isToday = props?.payload?.isToday;
+                      return [`${ppm} · 검사 ${total.toLocaleString()}개${isToday ? " (오늘)" : ""}`, "평균 pred"];
+                    }}
+                  />
+                  {threshold !== null && (
+                    <ReferenceLine
+                      y={threshold}
+                      stroke={CHART_COLORS.danger}
+                      strokeDasharray="4 4"
+                      strokeWidth={1.2}
+                      label={{
+                        value: `p95 ${Math.round(threshold).toLocaleString()}`,
+                        fontSize: 10,
+                        fill: CHART_COLORS.danger,
+                        position: "insideTopRight",
+                      }}
+                    />
+                  )}
+                  <Line
+                    type="monotone"
+                    dataKey="meanPredPpm"
+                    stroke={CHART_COLORS.primary}
+                    strokeWidth={2}
+                    dot={(props: any) => {
+                      const { cx, cy, payload, index } = props;
+                      const isT = payload?.isToday;
+                      return (
+                        <circle
+                          key={`dot-${index}`}
+                          cx={cx}
+                          cy={cy}
+                          r={isT ? 6 : 3.5}
+                          fill={isT ? TODAY_COLOR : CHART_COLORS.primary}
+                          stroke="#fff"
+                          strokeWidth={isT ? 2 : 1}
+                        />
+                      );
+                    }}
+                    activeDot={{ r: 6 }}
+                    label={(props: any) => {
+                      const { x, y, index } = props;
+                      const d = trend7d[index];
+                      if (!d?.isToday) return <g key={`lbl-${index}`} />;
+                      return (
+                        <g key={`lbl-${index}`}>
+                          <rect
+                            x={x - 22}
+                            y={y - 26}
+                            width={44}
+                            height={18}
+                            rx={4}
+                            fill={TODAY_COLOR}
+                          />
+                          <text
+                            x={x}
+                            y={y - 13}
+                            textAnchor="middle"
+                            fontSize={11}
+                            fontWeight={700}
+                            fill="#fff"
+                          >
+                            오늘
+                          </text>
+                        </g>
+                      );
+                    }}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </Panel>
+        );
+      })()}
 
       {/* 메인 시계열 — today 모드에서는 표시 안 함 (하루치라 의미 없음) */}
       {status !== "today" && (
         <Panel
-          title="기간별 처리량 & 평균 pred (ppm)"
+          title="기간별 평균 ppm"
           right={
             <div className="flex items-center gap-2 flex-wrap">
               <span className="chip chip-tbd" title="Mann-Kendall 추세 검정 미연결">
                 <span aria-hidden>⚠</span>
                 <span>추세 검정 — TBD</span>
               </span>
+              {triageQ.data && (
+                <span
+                  className="text-[10px] text-brand-danger font-semibold"
+                  title="위험 분류 임계값 (해당 status pred 상위 5%)"
+                >
+                  임계값 {Math.round(healthToPpm(triageQ.data.scale.risk_threshold)).toLocaleString()} ppm
+                </span>
+              )}
               <div className="inline-flex bg-brand-subtle rounded-md overflow-hidden">
                 {(["day", "week"] as Granularity[]).map((g) => (
                   <button
@@ -517,6 +579,7 @@ export default function Overview() {
                   dataKey="label"
                   tick={CHART_TICK}
                   interval={granularity === "day" ? 3 : 0}
+                  padding={{ left: 0, right: 0 }}
                 />
                 <YAxis
                   tick={CHART_TICK}
@@ -546,297 +609,193 @@ export default function Overview() {
                   cursor="pointer"
                   onClick={(d: any) => setSelectedDateLabel(d?.label ?? null)}
                 />
+                {/* p95 위험 임계값 수평선 */}
+                {triageQ.data && (
+                  <ReferenceLine
+                    y={healthToPpm(triageQ.data.scale.risk_threshold)}
+                    stroke={CHART_COLORS.danger}
+                    strokeDasharray="4 4"
+                    strokeWidth={1.5}
+                    label={{
+                      value: `p95 임계 ${Math.round(healthToPpm(triageQ.data.scale.risk_threshold)).toLocaleString()}`,
+                      fontSize: 10,
+                      fill: CHART_COLORS.danger,
+                      position: "insideTopRight",
+                    }}
+                  />
+                )}
               </BarChart>
             </ResponsiveContainer>
           </div>
         </Panel>
       )}
 
-      {/* 글로벌 비정상 변수 — 현재 status의 위험 unit이 정상 baseline 대비 가장 벗어난 변수 Top 10 */}
-      {globalAnomalyQ.data && globalAnomalyQ.data.items.length > 0 && (
+      {/* 좌: Grade 분포 / 우: 위험군 vs 정상군 분리력 */}
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 sm:gap-5 mb-4 sm:mb-5">
+        {(() => {
+          const todayUnits = (allUnitsQ.data?.items ?? []).filter((u) => u.status === "today");
+          const counts: Record<string, number> = { A: 0, B: 0, C: 0, D: 0 };
+          for (const u of todayUnits) {
+            const ppm = u.pred * 1_000_000;
+            const t = TIERS.find((x) => ppm >= x.minPpm && ppm < x.maxPpm)?.tier ?? "D";
+            counts[t]++;
+          }
+          const total = todayUnits.length || 1;
+          const data = TIERS.map((t) => ({
+            grade: t.tier,
+            label: `Grade ${t.tier}`,
+            desc: t.desc,
+            count: counts[t.tier] ?? 0,
+            ratio: ((counts[t.tier] ?? 0) / total) * 100,
+            color: t.color,
+          }));
+          return (
+            <Panel
+              title="오늘 Grade 분포"
+              right={
+                <span className="text-[11px] text-brand-textMuted">
+                  ppm 기준 4단계 — 총 {todayUnits.length.toLocaleString()} unit
+                </span>
+              }
+            >
+              <div style={chartBox(220)}>
+                <ResponsiveContainer>
+                  <BarChart data={data} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
+                    <CartesianGrid {...CHART_GRID} />
+                    <XAxis dataKey="label" tick={CHART_TICK} />
+                    <YAxis tick={CHART_TICK} tickFormatter={(v) => v.toLocaleString()} />
+                    <Tooltip
+                      contentStyle={CHART_TOOLTIP_STYLE}
+                      formatter={(_v: any, _n: any, p: any) => {
+                        const d = p?.payload;
+                        return [
+                          `${d.count.toLocaleString()} unit (${d.ratio.toFixed(1)}%)`,
+                          d.desc,
+                        ];
+                      }}
+                    />
+                    <Bar dataKey="count" radius={BAR_RADIUS}>
+                      {data.map((d, i) => {
+                        return <Cell key={`grade-${i}`} fill={d.color} />;
+                      })}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="grid grid-cols-4 gap-2 mt-2">
+                {data.map((d) => (
+                  <div
+                    key={d.grade}
+                    className="rounded-md border border-brand-border bg-white px-2 py-1.5"
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <span
+                        className="inline-block w-2.5 h-2.5 rounded-sm"
+                        style={{ background: d.color }}
+                      />
+                      <span className="text-[11px] font-semibold text-brand-text">
+                        Grade {d.grade}
+                      </span>
+                    </div>
+                    <div className="text-[10px] text-brand-textMuted mt-0.5">{d.desc}</div>
+                    <div className="text-[14px] font-bold tabular text-brand-text mt-0.5">
+                      {d.count.toLocaleString()}
+                      <span className="text-[10px] text-brand-textMuted font-normal ml-1">
+                        ({d.ratio.toFixed(1)}%)
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </Panel>
+          );
+        })()}
+
         <Panel
-          title="위험 unit이 정상 대비 벗어난 변수 Top 10"
+          title="위험군 vs 정상군 분리력 (단위별)"
           right={
-            <span className="text-[10px] text-brand-textMuted">
-              위험 unit {fmtInt(globalAnomalyQ.data.n_risk_units)}개 평균 vs 정상 unit 평균 ·
-              z = |Δ| / 정상 std
+            <span className="text-[10px] text-brand-textMuted" title="anomaly_explore.ipynb 산출물">
+              high = pred 상위 10%
             </span>
           }
-          className="mb-4 sm:mb-5"
         >
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
-            {globalAnomalyQ.data.items.map((it) => {
-              const minV = Math.min(it.normal_mean, it.risk_mean);
-              const maxV = Math.max(it.normal_mean, it.risk_mean);
-              const range = Math.max(Math.abs(maxV - minV), Math.abs(maxV) * 0.1, 1e-9);
-              const axisMin = minV - range * 0.15;
-              const axisMax = maxV + range * 0.15;
-              const span = axisMax - axisMin || 1;
-              const normalLen = ((it.normal_mean - axisMin) / span) * 100;
-              const riskLen = ((it.risk_mean - axisMin) / span) * 100;
-              const isHigher = it.risk_mean > it.normal_mean;
-              const zSeverity =
-                it.z_score >= 3 ? "text-brand-danger" : it.z_score >= 2 ? "text-brand-warn" : "text-brand-textMuted";
+          {/* 단위별 분리력 요약 — wafer/unit/die 비교 */}
+          <div className="grid grid-cols-3 gap-2 mb-3">
+            {[
+              { level: "wafer", n: 431, nHigh: 44, maxAuc: 0.831, ge07: 136, ge08: 3 },
+              { level: "unit", n: 34914, nHigh: 3492, maxAuc: 0.771, ge07: 35, ge08: 0 },
+              { level: "die", n: 139656, nHigh: 13966, maxAuc: 0.729, ge07: 9, ge08: 0 },
+            ].map((row) => {
+              const aucPct = Math.round(row.maxAuc * 100);
+              const tone = row.maxAuc >= 0.8 ? "text-brand-danger"
+                : row.maxAuc >= 0.75 ? "text-amber-600"
+                : "text-brand-primary";
               return (
-                <div key={it.feature} className="border border-brand-border rounded-md p-2.5">
-                  <div className="flex items-center justify-between mb-1.5">
-                    <div className="flex items-center gap-1.5">
-                      <span className="font-mono text-[12px] font-semibold text-brand-text">{it.feature}</span>
-                      <span className={`text-[11px] font-bold ${zSeverity}`}>z={it.z_score.toFixed(2)}</span>
-                    </div>
-                    <span className="text-[10px] text-brand-textMuted">
-                      {isHigher ? "▲ 위험군이 더 높음" : "▼ 위험군이 더 낮음"}
-                    </span>
+                <div key={row.level} className="rounded-lg border border-brand-border bg-white p-2.5">
+                  <div className="text-[11px] font-semibold text-brand-text uppercase tracking-wide">
+                    {row.level}
                   </div>
-                  {/* 정상 평균 막대 */}
-                  <div className="flex items-center gap-1.5 mb-0.5">
-                    <span className="text-[10px] text-brand-textMuted w-10 shrink-0">정상</span>
-                    <div className="flex-1 h-3.5 bg-brand-subtle rounded-sm relative">
-                      <div
-                        className="absolute top-0 bottom-0 left-0 bg-emerald-500 rounded-sm"
-                        style={{ width: `${normalLen}%` }}
-                      />
-                    </div>
-                    <span className="text-[10px] text-brand-textMuted tabular w-14 shrink-0 text-right">
-                      {fmtNum(it.normal_mean, 2)}
-                    </span>
+                  <div className={`text-[24px] font-bold tabular leading-tight ${tone}`}>
+                    {aucPct}<span className="text-[12px] text-brand-textMuted ml-0.5">% AUC</span>
                   </div>
-                  {/* 위험 unit 평균 막대 */}
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-[10px] text-brand-text font-semibold w-10 shrink-0">위험</span>
-                    <div className="flex-1 h-3.5 bg-brand-subtle rounded-sm relative">
-                      <div
-                        className={`absolute top-0 bottom-0 left-0 rounded-sm ${isHigher ? "bg-brand-danger" : "bg-brand-primary"}`}
-                        style={{ width: `${riskLen}%` }}
-                      />
-                    </div>
-                    <span className={`text-[10px] tabular w-14 shrink-0 text-right font-semibold ${isHigher ? "text-brand-danger" : "text-brand-primary"}`}>
-                      {fmtNum(it.risk_mean, 2)}
-                    </span>
+                  <div className="text-[10px] text-brand-textMuted mt-1 leading-snug">
+                    n={row.n.toLocaleString()} (high {row.nHigh.toLocaleString()})
+                  </div>
+                  <div className="text-[10px] text-brand-textMuted mt-0.5">
+                    AUC≥0.7: <span className="font-semibold text-brand-text">{row.ge07}</span>
+                    {" · "}≥0.8: <span className="font-semibold text-brand-text">{row.ge08}</span>
                   </div>
                 </div>
               );
             })}
           </div>
-        </Panel>
-      )}
 
-      {/* Top 위험 + 분포 */}
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 sm:gap-5 mb-4 sm:mb-5">
-        <Panel
-          title="위험 wafer Top 10"
-          right={
-            <Link to="/drilldown" className="text-[11px] text-brand-link hover:underline">
-              자세히 →
-            </Link>
-          }
-          bodyClassName="p-0"
-        >
-          <div className="overflow-x-auto">
-            <table className="spotfire">
-              <thead>
-                <tr>
-                  <th>Wafer</th>
-                  <th className="text-right">Units</th>
-                  <th className="text-right">위험</th>
-                  <th className="text-right">비율</th>
-                </tr>
-              </thead>
-              <tbody>
-                {triageQ.data.top_wafers.slice(0, 10).map((w) => (
-                  <tr key={w.wafer_key}>
-                    <td>
-                      <Link
-                        to={`/drilldown?key=${encodeURIComponent(w.wafer_key)}`}
-                        className="text-brand-link hover:underline font-mono"
-                      >
-                        {w.wafer_key}
-                      </Link>
-                    </td>
-                    <td className="text-right tabular">{fmtInt(w.n_units)}</td>
-                    <td className="text-right tabular text-brand-danger font-semibold">
-                      {fmtInt(w.n_risk)}
-                    </td>
-                    <td className="text-right tabular font-bold">{fmtPct(w.risk_ratio)}</td>
-                  </tr>
-                ))}
-                {triageQ.data.top_wafers.length === 0 && (
-                  <tr><td colSpan={4} className="text-center text-brand-textMuted p-3">
-                    데이터 없음
-                  </td></tr>
-                )}
-              </tbody>
-            </table>
+          {/* 3단위 공통 Top feature — wafer AUC 기준 막대 */}
+          <div className="text-[11px] font-semibold text-brand-text mb-1">
+            3단위 공통 Top Feature <span className="text-brand-textMuted font-normal">(wafer/unit/die Top 20 모두 포함)</span>
           </div>
-        </Panel>
-
-        <Panel
-          title="위험 unit Top 10"
-          right={
-            <button
-              onClick={() => downloadCsv(triageQ.data.top_units, `risk_units_${status}.csv`)}
-              className="btn btn-primary text-[10px]"
-              disabled={triageQ.data.top_units.length === 0}
-            >
-              ↓ CSV
-            </button>
-          }
-          bodyClassName="p-0"
-        >
-          <div className="overflow-x-auto">
-            <table className="spotfire">
-              <thead>
-                <tr>
-                  <th>Unit</th>
-                  <th className="text-right">예측 ppm</th>
-                  <th>Wafer</th>
-                </tr>
-              </thead>
-              <tbody>
-                {triageQ.data.top_units.slice(0, 10).map((u) => (
-                  <tr key={u.ufs_serial}>
-                    <td className="font-mono">{u.ufs_serial}</td>
-                    <td className="text-right tabular font-mono font-bold text-brand-danger">
-                      {fmtPpm(healthToPpm(u.pred))}
-                    </td>
-                    <td>
-                      <Link
-                        to={`/drilldown?key=${u.wafer_key}`}
-                        className="text-brand-link hover:underline font-mono"
-                      >
-                        {u.wafer_key}
-                      </Link>
-                    </td>
-                  </tr>
-                ))}
-                {triageQ.data.top_units.length === 0 && (
-                  <tr><td colSpan={3} className="text-center text-brand-textMuted p-3">
-                    데이터 없음
-                  </td></tr>
-                )}
-              </tbody>
-            </table>
+          <div style={chartBox(180)}>
+            <ResponsiveContainer>
+              <BarChart
+                data={[
+                  { feature: "X769", auc: 0.831, cohenD: +1.21 },
+                  { feature: "X739", auc: 0.806, cohenD: +1.10 },
+                  { feature: "X774", auc: 0.798, cohenD: +1.21 },
+                  { feature: "X876", auc: 0.796, cohenD: -1.23 },
+                  { feature: "X844", auc: 0.792, cohenD: -0.99 },
+                  { feature: "X734", auc: 0.791, cohenD: +1.20 },
+                  { feature: "X744", auc: 0.785, cohenD: +1.03 },
+                  { feature: "X773", auc: 0.780, cohenD: +1.12 },
+                  { feature: "X770", auc: 0.778, cohenD: +1.12 },
+                  { feature: "X771", auc: 0.776, cohenD: +1.10 },
+                  { feature: "X772", auc: 0.775, cohenD: +1.09 },
+                ]}
+                layout="vertical"
+                margin={{ left: 30, right: 40, top: 5, bottom: 5 }}
+              >
+                <CartesianGrid {...CHART_GRID} horizontal={false} />
+                <XAxis type="number" domain={[0.5, 0.85]} tick={CHART_TICK} />
+                <YAxis type="category" dataKey="feature" tick={CHART_TICK} width={45} />
+                <Tooltip
+                  contentStyle={CHART_TOOLTIP_STYLE}
+                  formatter={(v: any, name: any) => {
+                    if (name === "auc") return [Number(v).toFixed(3), "AUC (wafer)"];
+                    return [v, name];
+                  }}
+                />
+                <ReferenceLine x={0.7} stroke="#f59e0b" strokeDasharray="3 3" />
+                <ReferenceLine x={0.8} stroke={CHART_COLORS.danger} strokeDasharray="3 3" />
+                <Bar dataKey="auc" fill={CHART_COLORS.primary} radius={[0, 4, 4, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="text-[10px] text-brand-textMuted mt-2 leading-snug">
+            wafer 단위에서 분리력이 가장 강함 (집계 노이즈 감소). 점선 = AUC 0.7(주의)·0.8(우수).
+            상위 11개 변수가 wafer/unit/die 모두에서 공통 Top — 동일 핵심 신호가 단위와 무관하게 작동.
           </div>
         </Panel>
       </div>
 
-      {/* Tier 분포 + 스크리닝 시뮬레이터 — 회귀 결과의 운영 의사결정 도구 */}
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 sm:gap-5 mb-4 sm:mb-5">
-        {/* Tier 등급 분포 */}
-        <Panel title="Tier 등급 분포 (S/A/B/C/D)">
-          <div className="space-y-2">
-            <div className="flex w-full h-7 rounded-md overflow-hidden border border-brand-border/60">
-              {tierDist.map((td) =>
-                td.count === 0 ? null : (
-                  <div
-                    key={td.tier}
-                    style={{ background: td.color, width: `${td.ratio * 100}%` }}
-                    className="text-[10px] text-white font-semibold flex items-center justify-center"
-                    title={`${td.tier}: ${td.count.toLocaleString()} (${(td.ratio * 100).toFixed(1)}%)`}
-                  >
-                    {td.ratio > 0.04 ? td.tier : ""}
-                  </div>
-                ),
-              )}
-            </div>
-            <table className="w-full text-[11px]">
-              <tbody>
-                {TIERS.map((tdef, i) => {
-                  const td = tierDist[i];
-                  return (
-                    <tr key={tdef.tier} className="border-b border-brand-border/40 last:border-0">
-                      <td className="py-1 pr-2">
-                        <span
-                          className="inline-block w-2.5 h-2.5 rounded-sm align-middle mr-1.5"
-                          style={{ background: tdef.color }}
-                        />
-                        <span className="font-semibold">{tdef.tier}</span>
-                        <span className="text-brand-textMuted ml-1">({tdef.desc})</span>
-                      </td>
-                      <td className="py-1 text-right tabular">{fmtInt(td?.count ?? 0)}</td>
-                      <td className="py-1 text-right tabular text-brand-textMuted w-12">
-                        {fmtPct(td?.ratio ?? 0, 1)}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-            <div className="text-[10px] text-brand-textMuted px-1">
-              * 등급은 의사결정용 그루핑 — 모델은 연속 ppm을 예측하며, 임계값은 운영 기준이지 모델 출력이 아님.
-            </div>
-          </div>
-        </Panel>
-
-        {/* 스크리닝 시뮬레이터 */}
-        <Panel
-          title="스크리닝 시뮬레이터"
-          right={
-            <span className="text-[11px] text-brand-textMuted">
-              임계 초과 unit을 출하 차단했을 때 fleet 품질 변화
-            </span>
-          }
-        >
-          <div className="space-y-3">
-            <div>
-              <div className="flex justify-between items-baseline mb-1">
-                <label className="text-[11px] font-medium text-brand-text">
-                  차단 임계 ppm
-                </label>
-                <span className="tabular text-[14px] font-bold text-brand-primary">
-                  {fmtPpm(screenThresholdPpm)}
-                </span>
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={4_500}
-                step={50}
-                value={screenThresholdPpm}
-                onChange={(e) => setScreenThresholdPpm(Number(e.target.value))}
-                className="w-full accent-brand-primary"
-              />
-              <div className="flex justify-between text-[10px] text-brand-textMuted mt-0.5">
-                <span>0</span>
-                <span>1.5k</span>
-                <span>3k</span>
-                <span>4.5k ppm</span>
-              </div>
-            </div>
-            <div className="grid grid-cols-2 gap-2 text-[11px]">
-              <div className="bg-brand-subtle rounded-md p-2">
-                <div className="text-brand-textMuted">차단율</div>
-                <div className="tabular text-[16px] font-bold text-brand-warn">
-                  {fmtPct(screenSim.blockRatio, 2)}
-                </div>
-                <div className="text-[10px] text-brand-textMuted">
-                  {fmtInt(screenSim.blocked)} / {fmtInt(filteredUnits.length)} unit
-                </div>
-              </div>
-              <div className="bg-brand-subtle rounded-md p-2">
-                <div className="text-brand-textMuted">통과 fleet 평균 ppm</div>
-                <div className="tabular text-[16px] font-bold text-brand-primary">
-                  {fmtPpm(screenSim.meanPpmPassed)}
-                </div>
-                <div className="text-[10px] text-brand-textMuted">
-                  차단 전: {fmtPpm(screenSim.meanPpmAll)}
-                </div>
-              </div>
-              <div className="bg-emerald-50 rounded-md p-2 col-span-2">
-                <div className="text-brand-textMuted">ppm 감소량 (스크리닝 효과)</div>
-                <div className="tabular text-[18px] font-bold text-emerald-600">
-                  {fmtPpm(screenSim.ppmReduction)} ↓
-                </div>
-                <div className="tbd-block mt-1.5">
-                  <span className="font-semibold">⚠ Field 영향 환산 — TBD:</span>{" "}
-                  사용자 수 × 일 동작 횟수 가정값이 아직 미연결.
-                  운영 가정이 정해지면 "ppm 감소량 × N"으로 하루 field error 감소량 표시 예정.
-                </div>
-              </div>
-            </div>
-          </div>
-        </Panel>
-      </div>
 
       {/* 시계열 막대 클릭 시 그 날짜 상세 모달 */}
       {selectedDateLabel && allUnitsQ.data && (() => {

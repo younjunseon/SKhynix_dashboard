@@ -12,6 +12,15 @@
 - feature_importance.csv   : feature, mu_gain, pi_gain, total_gain (5-fold 평균)
 - psi.csv                  : feature, psi (train ↔ validation)
 - var_compare.csv          : feature, cohens_d, p_value (위험 unit pred>p95 vs 정상)
+- shap_mu_unit.parquet     : unit-level SHAP (μ component, 5-fold 평균, die→unit mean)
+- shap_pi_unit.parquet     : unit-level SHAP (π component, 5-fold 평균)
+- shap_base.json           : base value (mu, pi) 5-fold 평균
+- shap_summary.csv         : feature별 mean(|shap_mu|), mean(|shap_pi|) — 정렬용
+
+추가 입력 (5번 SHAP 단계용)
+- 0_data/compet_ys_*.csv (3개)            (load_all 통해 로드)
+- 4_output/final/zit_only/oof_die.csv     (검증 가드용, 없으면 가드 스킵)
+- 패키지: shap
 
 산출물은 정적 (재실행 전까지 변경 X). FastAPI가 메모리 로드해 서빙.
 재실행이 필요한 경우: 모델 재학습 / 원본 데이터 변경 / 위험 임계 변경.
@@ -37,9 +46,22 @@ sys.path.insert(0, str(PROJECT_ROOT / "3_modeling"))
 # 학습 코드의 KFold 함수를 그대로 재사용 — fold split 재현성 보장
 from final.modules.hpo import _make_unit_folds  # noqa: E402
 
+# SHAP 단계 (5번)에서만 사용 — 무거운 import는 main() 안에서 lazy import
+# from final.modules import preprocess
+# from utils.data import load_all, get_feat_cols, split_xs
+# from utils.config import KEY_COL, TARGET_COL
+# import shap
+
 SEED = 42
 N_FOLDS = 5
 RISK_PERCENTILE = 0.95  # pred 상위 5%를 위험군으로 정의
+
+# SHAP 산출 시 학습 시점 전처리 파라미터 (01_zit_only.ipynb과 동일)
+# - PARAMS={} (DEFAULT_PARAMS) + CLIP_Y_EXTREME=True
+# - 다른 PARAMS로 학습한 pkl이라면 5-2 검증 가드에서 RMSE 불일치로 raise됨
+SHAP_PARAMS: dict = {}
+SHAP_CLIP_Y_EXTREME = True
+SHAP_RMSE_TOL = 1e-6  # 재예측 RMSE vs 저장된 oof_unit.csv RMSE 허용 오차
 
 OUT_DIR = HERE / "data" / "model"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -75,12 +97,199 @@ def calc_psi(a: np.ndarray, b: np.ndarray, n_bins: int = 10) -> float:
     return float(np.sum((a_pct - b_pct) * np.log(a_pct / b_pct)))
 
 
+def build_shap_artifacts(fm: dict, oof: pd.DataFrame) -> dict:
+    """SHAP 산출물 생성 (μ, π 분리, 5-fold 평균, unit-level mean 집계).
+
+    절차
+    ----
+    1. utils.data.load_all() + preprocess.run() 으로 die-level 전처리본 재구성
+       (01_zit_only.ipynb와 동일 — PARAMS=SHAP_PARAMS, CLIP_Y_EXTREME 적용)
+    2. 검증 가드: feat_cols가 pkl의 feature_names와 일치하는지 + die-level OOF 재예측이
+       기존 oof_die.csv와 SHAP_RMSE_TOL 이내로 일치하는지 검사
+       (어긋나면 학습 시점 PARAMS가 다르다는 뜻 → raise)
+    3. 각 fold 모델의 lgb_mu_, lgb_pi_ 에 TreeExplainer → train + val + test
+       die-level shap 5-fold 평균
+    4. die→unit mean 집계 (학습 시 unit pred = die pred mean과 동일 규약)
+    5. parquet/json/csv 저장
+    """
+    import shap as _shap  # noqa: WPS433
+    from final.modules import preprocess as _pp  # noqa: WPS433
+    from utils.data import load_all, get_feat_cols, split_xs  # noqa: WPS433
+    from utils.config import KEY_COL, TARGET_COL  # noqa: WPS433
+
+    feature_names: list[str] = list(fm["feature_names"])
+    fold_models = fm["fold_models"]
+    n_feat = len(feature_names)
+
+    # ── 1. 전처리 재실행 ──────────────────────────────────────
+    log("  [5-1] load_all + preprocess.run (PARAMS={} = DEFAULT_PARAMS)")
+    xs, ys = load_all()
+    feat_cols_raw = get_feat_cols(xs)
+    xs_dict = split_xs(xs)
+
+    ys_input = {k: v.copy() for k, v in ys.items()}
+    if SHAP_CLIP_Y_EXTREME:
+        y_raw = ys_input["train"][TARGET_COL]
+        second_max = y_raw[y_raw < y_raw.max()].max()
+        n_clipped = int((y_raw >= 1.0).sum())
+        ys_input["train"][TARGET_COL] = y_raw.clip(upper=second_max)
+        log(f"  [CLIP_Y_EXTREME] {y_raw.max():.6f} → {second_max:.6f} "
+            f"({n_clipped}개 clip)")
+
+    pp = _pp.run(xs, ys_input, feat_cols_raw, xs_dict, params=SHAP_PARAMS)
+    xs_train = pp["xs_train"]
+    xs_val = pp["xs_val"]
+    xs_test = pp["xs_test"]
+    feat_cols_clean: list[str] = pp["feat_cols"]
+    log(f"  전처리 완료: train={xs_train.shape}, val={xs_val.shape}, "
+        f"test={xs_test.shape}, feat={len(feat_cols_clean)}")
+
+    # ── 2. 검증 가드 ─────────────────────────────────────────
+    log("  [5-2] 검증 가드: feat_cols 일치 + OOF die 재현")
+    if feat_cols_clean != feature_names:
+        diff_a = set(feat_cols_clean) - set(feature_names)
+        diff_b = set(feature_names) - set(feat_cols_clean)
+        raise RuntimeError(
+            "feat_cols 불일치 — preprocess 결과가 학습 시점과 다름. "
+            f"전처리 추가({len(diff_a)}): {sorted(diff_a)[:5]}, "
+            f"전처리 누락({len(diff_b)}): {sorted(diff_b)[:5]}"
+        )
+
+    X_train = xs_train[feature_names].values
+    X_val = xs_val[feature_names].values
+    X_test = xs_test[feature_names].values
+    log(f"  X shape: train={X_train.shape}, val={X_val.shape}, test={X_test.shape}")
+
+    # OOF 재예측 (refit_best와 동일 로직: fold별 holdout만 채움)
+    train_units = ys_input["train"][KEY_COL].unique()
+    folds = _make_unit_folds(train_units, N_FOLDS, SEED)
+
+    n_tr_die = len(xs_train)
+    oof_pred_die = np.full(n_tr_die, np.nan)
+    val_pred_die = np.zeros(len(xs_val))
+    test_pred_die = np.zeros(len(xs_test))
+
+    for i, ((_tr, vl_units), model) in enumerate(zip(folds, fold_models)):
+        vl_mask = xs_train[KEY_COL].isin(set(vl_units)).values
+        oof_pred_die[vl_mask] = model.predict(X_train[vl_mask])
+        val_pred_die += model.predict(X_val) / N_FOLDS
+        test_pred_die += model.predict(X_test) / N_FOLDS
+        log(f"    fold {i+1}/{N_FOLDS} predict done")
+
+    if np.isnan(oof_pred_die).any():
+        raise RuntimeError("OOF 재예측에 NaN — fold split 재현 실패")
+
+    # 저장된 oof_die.csv와 die-level pred 직접 비교 (가장 엄격한 가드)
+    oof_die_path = OOF_PATH.parent / "oof_die.csv"
+    if oof_die_path.exists():
+        oof_die_saved = pd.read_csv(oof_die_path, usecols=["pred"])
+        if len(oof_die_saved) != n_tr_die:
+            raise RuntimeError(
+                f"oof_die.csv 행수 불일치: 저장 {len(oof_die_saved)} vs "
+                f"재예측 {n_tr_die}"
+            )
+        diff_max = float(np.max(np.abs(oof_die_saved["pred"].values - oof_pred_die)))
+        log(f"  oof_die pred max abs diff = {diff_max:.2e}")
+        if diff_max > SHAP_RMSE_TOL:
+            raise RuntimeError(
+                f"OOF 재예측 불일치 (max abs diff={diff_max:.2e} > tol={SHAP_RMSE_TOL}). "
+                "학습 시점 PARAMS가 SHAP_PARAMS({})와 다를 가능성 — "
+                "study_meta.effective_pp_params 확인 후 SHAP_PARAMS에 반영 필요."
+            )
+        log("  ✓ OOF die 예측 일치 — 학습 시점 전처리 재현 확인")
+    else:
+        log(f"  ⚠ {oof_die_path.name} 없음 — die-level diff 가드 스킵")
+
+    # ── 3. SHAP 계산 (die-level, 5-fold 평균) ──────────────────
+    log("  [5-3] TreeExplainer (lgb_mu, lgb_pi) × 5 fold")
+    shap_mu_train = np.zeros((n_tr_die, n_feat), dtype=np.float32)
+    shap_mu_val = np.zeros((len(xs_val), n_feat), dtype=np.float32)
+    shap_mu_test = np.zeros((len(xs_test), n_feat), dtype=np.float32)
+    shap_pi_train = np.zeros_like(shap_mu_train)
+    shap_pi_val = np.zeros_like(shap_mu_val)
+    shap_pi_test = np.zeros_like(shap_mu_test)
+    mu_base = 0.0
+    pi_base = 0.0
+
+    for i, model in enumerate(fold_models):
+        ex_mu = _shap.TreeExplainer(model.lgb_mu_)
+        ex_pi = _shap.TreeExplainer(model.lgb_pi_)
+        shap_mu_train += ex_mu.shap_values(X_train).astype(np.float32) / N_FOLDS
+        shap_mu_val += ex_mu.shap_values(X_val).astype(np.float32) / N_FOLDS
+        shap_mu_test += ex_mu.shap_values(X_test).astype(np.float32) / N_FOLDS
+        shap_pi_train += ex_pi.shap_values(X_train).astype(np.float32) / N_FOLDS
+        shap_pi_val += ex_pi.shap_values(X_val).astype(np.float32) / N_FOLDS
+        shap_pi_test += ex_pi.shap_values(X_test).astype(np.float32) / N_FOLDS
+        mu_base += float(np.asarray(ex_mu.expected_value).ravel()[0]) / N_FOLDS
+        pi_base += float(np.asarray(ex_pi.expected_value).ravel()[0]) / N_FOLDS
+        log(f"    fold {i+1}/{N_FOLDS} SHAP done")
+
+    # ── 4. die→unit mean 집계 ────────────────────────────────
+    log("  [5-4] die→unit mean 집계")
+
+    def _die_to_unit_shap(xs_split: pd.DataFrame, shap_die: np.ndarray) -> pd.DataFrame:
+        df = pd.DataFrame(shap_die, columns=feature_names)
+        df[KEY_COL] = xs_split[KEY_COL].values
+        return df.groupby(KEY_COL, sort=False)[feature_names].mean().reset_index()
+
+    mu_units = []
+    pi_units = []
+    for split_name, xs_split, sh_mu, sh_pi in [
+        ("train", xs_train, shap_mu_train, shap_pi_train),
+        ("validation", xs_val, shap_mu_val, shap_pi_val),
+        ("test", xs_test, shap_mu_test, shap_pi_test),
+    ]:
+        mu_u = _die_to_unit_shap(xs_split, sh_mu)
+        pi_u = _die_to_unit_shap(xs_split, sh_pi)
+        mu_u["split"] = split_name
+        pi_u["split"] = split_name
+        mu_units.append(mu_u)
+        pi_units.append(pi_u)
+
+    shap_mu_unit = pd.concat(mu_units, ignore_index=True)
+    shap_pi_unit = pd.concat(pi_units, ignore_index=True)
+    log(f"  unit-level shape: mu={shap_mu_unit.shape}, pi={shap_pi_unit.shape}")
+
+    # ── 5. 저장 ──────────────────────────────────────────────
+    log("  [5-5] 저장")
+    shap_mu_unit.to_parquet(OUT_DIR / "shap_mu_unit.parquet", index=False)
+    shap_pi_unit.to_parquet(OUT_DIR / "shap_pi_unit.parquet", index=False)
+
+    with (OUT_DIR / "shap_base.json").open("w", encoding="utf-8") as f:
+        json.dump({"mu_base": mu_base, "pi_base": pi_base}, f, indent=2)
+
+    summary = pd.DataFrame({
+        "feature": feature_names,
+        "mean_abs_shap_mu": np.abs(shap_mu_unit[feature_names].values).mean(axis=0),
+        "mean_abs_shap_pi": np.abs(shap_pi_unit[feature_names].values).mean(axis=0),
+    })
+    summary["mean_abs_shap_total"] = (
+        summary["mean_abs_shap_mu"] + summary["mean_abs_shap_pi"]
+    )
+    summary = (summary.sort_values("mean_abs_shap_total", ascending=False)
+               .reset_index(drop=True))
+    summary.to_csv(OUT_DIR / "shap_summary.csv", index=False)
+    log(f"  → shap_summary.csv (Top 5: "
+        f"{', '.join(summary['feature'].head(5).tolist())})")
+
+    return {
+        "n_units": int(len(shap_mu_unit)),
+        "n_features": n_feat,
+        "mu_base": mu_base,
+        "pi_base": pi_base,
+        "params_used": {
+            "SHAP_PARAMS": SHAP_PARAMS,
+            "CLIP_Y_EXTREME": SHAP_CLIP_Y_EXTREME,
+        },
+    }
+
+
 def main() -> None:
     t0 = time.time()
     log(f"OUT_DIR: {OUT_DIR}")
 
     # ─── 1. fold별 RMSE ─────────────────────────────────────────
-    log("[1/4] fold별 RMSE")
+    log("[1/5] fold별 RMSE")
     oof = pd.read_csv(OOF_PATH)
     if not {"ufs_serial", "pred", "health"}.issubset(oof.columns):
         raise RuntimeError(f"oof_unit.csv 컬럼 부족: {oof.columns.tolist()}")
@@ -112,7 +321,7 @@ def main() -> None:
     )
 
     # ─── 2. feature importance (mu, pi 5-fold 평균) ─────────────
-    log("[2/4] feature importance")
+    log("[2/5] feature importance")
     with FM_PATH.open("rb") as f:
         fm = pickle.load(f)
     feature_names: list[str] = list(fm["feature_names"])
@@ -143,7 +352,7 @@ def main() -> None:
     )
 
     # ─── 3. PSI (train ↔ validation) ────────────────────────────
-    log("[3/4] PSI (train ↔ validation)")
+    log("[3/5] PSI (train ↔ validation)")
     # 원본 X csv의 실제 컬럼만 사용 (_missing 같은 derived feature는 제외)
     xs_header = pd.read_csv(XS_PATH, nrows=0)
     xs_x_cols = {c for c in xs_header.columns if c.startswith("X")}
@@ -182,7 +391,7 @@ def main() -> None:
     )
 
     # ─── 4. 위험군 vs 정상군 t-test + Cohen's d ────────────────
-    log("[4/4] 위험군 vs 정상군 변수 비교")
+    log("[4/5] 위험군 vs 정상군 변수 비교")
     threshold = float(oof["pred"].quantile(RISK_PERCENTILE))
     risk_units = set(oof[oof["pred"] > threshold]["ufs_serial"])
     log(
@@ -239,6 +448,10 @@ def main() -> None:
         f"{', '.join(var_df['feature'].head(5).tolist())})"
     )
 
+    # ─── 5. SHAP (μ, π 각각, 5-fold 평균, unit-level) ───────────
+    log("[5/5] SHAP (μ, π) — preprocess 재실행 + TreeExplainer")
+    shap_outputs = build_shap_artifacts(fm, oof)
+
     # ─── manifest ──────────────────────────────────────────────
     manifest = {
         "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -247,17 +460,22 @@ def main() -> None:
         "risk_percentile": RISK_PERCENTILE,
         "n_features": n_feat,
         "n_features_in_xs": len(feat_in_xs),
+        "shap": shap_outputs,  # dict: 검증 가드 결과 + 저장 파일 메타
         "outputs": {
             "fold_metrics.json": "fold별 RMSE",
             "feature_importance.csv": "5-fold 평균 LGBM gain (mu/pi)",
             "psi.csv": "train ↔ validation 분포 변화",
             "var_compare.csv": "위험 vs 정상 unit 변수 비교 (t-test + Cohen's d)",
+            "shap_mu_unit.parquet": "unit-level SHAP (μ component, 5-fold 평균, die→unit mean)",
+            "shap_pi_unit.parquet": "unit-level SHAP (π component, 5-fold 평균, die→unit mean)",
+            "shap_base.json": "base value (mu, pi) 5-fold 평균",
+            "shap_summary.csv": "feature별 mean(|shap_mu|), mean(|shap_pi|) — 정렬용",
         },
     }
     with (OUT_DIR / "manifest.json").open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
-    log(f"전체 완료 ({time.time() - t0:.1f}s) - 산출물 5종 (manifest 포함) -> {OUT_DIR}")
+    log(f"전체 완료 ({time.time() - t0:.1f}s) - 산출물 9종 (manifest 포함) -> {OUT_DIR}")
 
 
 if __name__ == "__main__":

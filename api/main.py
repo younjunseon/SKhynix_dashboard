@@ -169,6 +169,29 @@ class DataStore:
             self.normal_baseline = None
             print("  [warn] unit_features.parquet / normal_baseline.parquet 없음 — 비정상 분석 비활성")
 
+        # feature ↔ health Pearson 상관 (Model 탭용 — health 실측 있는 unit만)
+        self.feature_corr = None
+        if self.unit_features is not None:
+            health_series = self.unit.dropna(subset=["health"]).set_index("ufs_serial")["health"]
+            common = self.unit_features.index.intersection(health_series.index)
+            if len(common) > 100:
+                X = self.unit_features.loc[common]
+                y = health_series.loc[common]
+                # 벡터화 Pearson r: cov(X, y) / (std(X) * std(y))
+                X_centered = X - X.mean()
+                y_centered = y - y.mean()
+                num = X_centered.mul(y_centered, axis=0).sum()
+                denom = np.sqrt((X_centered ** 2).sum() * (y_centered ** 2).sum())
+                r = (num / denom.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
+                self.feature_corr = pd.DataFrame({
+                    "feature": r.index,
+                    "r": r.values,
+                    "abs_r": r.abs().values,
+                }).sort_values("abs_r", ascending=False).reset_index(drop=True)
+                print(f"  feature-target corr: {len(self.feature_corr)} feats, max |r|={self.feature_corr['abs_r'].max():.4f} (n={len(common)})")
+            else:
+                print(f"  [warn] feature-target corr: 공통 unit 부족 ({len(common)})")
+
         # 조회 성능을 위해 인덱스 설정
         self.unit_indexed = self.unit.set_index("ufs_serial", drop=False)
         self.die_by_unit = {k: g for k, g in self.die.groupby("ufs_serial")}
@@ -208,10 +231,11 @@ store: Optional[DataStore] = None
 # ─── FastAPI 앱 ────────────────────────────────────────────
 app = FastAPI(title="Wafer Health Dashboard API", version="0.2.0")
 
-# React dev server (5173) 허용
+# React dev server (5173) + cloudflared 임시 터널 허용
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origin_regex=r"https://.*\.trycloudflare\.com",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -696,7 +720,7 @@ def unit_report(ufs_serial: str):
     }
 
 
-@app.get("/")
+@app.get("/api")
 def root():
     return {
         "service": "Wafer Health Dashboard API",
@@ -734,8 +758,80 @@ def model_psi(top: int = Query(20, ge=1, le=100)):
     return {"items": df.to_dict(orient="records")}
 
 
+@app.get("/api/model/feature-corr")
+def model_feature_corr(top: int = Query(10, ge=1, le=100)):
+    """feature ↔ health Pearson 상관 Top N (|r| 기준).
+
+    health 실측 있는 unit만 사용 (split=train + status=completed).
+    EDA 결과 max |r|≈0.037 — 단일 피처로는 예측 불가, 비선형 모델 필요성 시각화.
+    """
+    if store.feature_corr is None:
+        raise HTTPException(503, "feature_corr 미준비 (unit_features.parquet 또는 health 부족)")
+    df = store.feature_corr.head(top)
+    return {
+        "items": df[["feature", "r", "abs_r"]].to_dict(orient="records"),
+        "n_total": int(len(store.feature_corr)),
+        "max_abs_r": float(store.feature_corr["abs_r"].max()),
+    }
+
+
+@app.get("/api/model/shap")
+def model_shap(top: int = Query(10, ge=1, le=100)):
+    """SHAP 근사 (임시 시뮬레이션) — feature_importance × var_compare 조합.
+
+    실제 SHAP은 추후 산출 예정. 현재는 기존 산출물로 의미 동등한 근사:
+      shap_like = sign(mean_risk - mean_norm) × |cohens_d| × norm(total_gain)
+        - 크기: 모델 importance × 위험/정상 분리 강도
+        - 부호: 위험군에서 평균이 크면 +(빨강) / 작으면 -(파랑)
+    """
+    fi = _require_model_artifact("feature_importance")
+    vc = _require_model_artifact("var_compare")
+    merged = fi.merge(vc, on="feature", how="inner")
+    if len(merged) == 0:
+        return {"items": [], "n_total": 0, "max_abs_shap": 0.0}
+    gain_max = merged["total_gain"].max() or 1.0
+    gain_norm = merged["total_gain"] / gain_max
+    direction = np.sign(merged["mean_risk"] - merged["mean_norm"])
+    shap_like = direction * merged["cohens_d"].abs() * gain_norm
+    merged["shap"] = shap_like
+    merged["abs_shap"] = shap_like.abs()
+    out = (
+        merged.sort_values("abs_shap", ascending=False)
+        .head(top)[["feature", "shap", "abs_shap", "total_gain", "cohens_d", "mean_risk", "mean_norm"]]
+    )
+    return {
+        "items": out.to_dict(orient="records"),
+        "n_total": int(len(merged)),
+        "max_abs_shap": float(merged["abs_shap"].max()),
+    }
+
+
 @app.get("/api/model/var-compare")
 def model_var_compare(top: int = Query(20, ge=1, le=100)):
     """위험(pred>p95) vs 정상 unit의 변수별 t-test + Cohen's d."""
     df = _require_model_artifact("var_compare").head(top)
     return {"items": df.to_dict(orient="records")}
+
+
+# ─── React 정적 파일 서빙 (시연 공유용 — frontend/dist 빌드 결과물) ─────
+# /api/* 는 위 라우트가 이미 잡았고, 나머지 경로는 React가 처리
+_FRONTEND_DIST = os.path.join(os.path.dirname(HERE), "frontend", "dist")
+if os.path.isdir(_FRONTEND_DIST):
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    # /assets, /icons.svg 등 빌드 산출물
+    app.mount(
+        "/assets",
+        StaticFiles(directory=os.path.join(_FRONTEND_DIST, "assets")),
+        name="assets",
+    )
+
+    @app.get("/{full_path:path}")
+    def _spa_fallback(full_path: str):
+        # API/문서 경로는 제외 (라우트 우선순위상 여기 도달하면 정적 파일)
+        candidate = os.path.join(_FRONTEND_DIST, full_path)
+        if full_path and os.path.isfile(candidate):
+            return FileResponse(candidate)
+        # SPA: 그 외 모두 index.html (React Router가 처리)
+        return FileResponse(os.path.join(_FRONTEND_DIST, "index.html"))

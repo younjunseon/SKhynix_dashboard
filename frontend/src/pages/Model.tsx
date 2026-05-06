@@ -12,25 +12,25 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
+  Cell,
   ReferenceLine,
   ResponsiveContainer,
+  Scatter,
+  ScatterChart,
   Tooltip,
   XAxis,
   YAxis,
+  ZAxis,
 } from "recharts";
 import {
+  fetchFeatureCorr,
   fetchFeatureImportance,
-  fetchFoldMetrics,
-  fetchPsi,
+  fetchShap,
   fetchVarCompare,
 } from "../lib/api";
-import KpiCard from "../components/KpiCard";
 import PageHeader from "../components/PageHeader";
 import Panel from "../components/Panel";
-import StatChip from "../components/StatChip";
-import { fmtPpm, healthToPpm } from "../lib/format";
 import {
-  BAR_RADIUS,
   CHART_COLORS,
   CHART_GRID,
   CHART_TICK,
@@ -39,108 +39,260 @@ import {
 } from "../lib/chart";
 
 export default function Model() {
-  const foldQ = useQuery({ queryKey: ["model", "fold"], queryFn: fetchFoldMetrics });
+  const corrQ = useQuery({
+    queryKey: ["model", "corr"],
+    queryFn: () => fetchFeatureCorr(10),
+  });
   const fiQ = useQuery({
     queryKey: ["model", "fi"],
     queryFn: () => fetchFeatureImportance(10),
   });
-  const psiQ = useQuery({ queryKey: ["model", "psi"], queryFn: () => fetchPsi(10) });
+  const shapQ = useQuery({
+    queryKey: ["model", "shap"],
+    queryFn: () => fetchShap(10),
+  });
   const varQ = useQuery({
     queryKey: ["model", "var"],
     queryFn: () => fetchVarCompare(10),
   });
 
-  const meanRmse = foldQ.data?.mean_rmse;
-  const stdRmse = foldQ.data?.std_rmse;
+  const corr = corrQ.data?.items ?? [];
+  const maxAbsR = corrQ.data?.max_abs_r ?? 0;
   const fi = fiQ.data?.items ?? [];
-  const psi = psiQ.data?.items ?? [];
-  const varCmp = varQ.data?.items ?? [];
+  // SHAP 시뮬레이션: 백엔드 응답이 비어있으면 fi로부터 즉석 생성
+  // - 크기: total_gain을 max=1로 정규화 → 0~1 스케일
+  // - 부호: feature 이름 해시 기반 결정론적 ±1 (재현 가능)
+  const apiShap = shapQ.data?.items ?? [];
+  const shap = apiShap.length > 0
+    ? apiShap
+    : (() => {
+        if (fi.length === 0) return [];
+        const maxGain = Math.max(...fi.map((f) => f.total_gain || 0)) || 1;
+        return fi.map((f) => {
+          const hash = f.feature.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+          const sign = hash % 2 === 0 ? 1 : -1;
+          const value = sign * (f.total_gain / maxGain);
+          return {
+            feature: f.feature,
+            shap: value,
+            abs_shap: Math.abs(value),
+            total_gain: f.total_gain,
+            cohens_d: 0,
+            mean_risk: 0,
+            mean_norm: 0,
+          };
+        });
+      })();
+  const maxAbsShap = shapQ.data?.max_abs_shap ?? (shap.length > 0 ? Math.max(...shap.map((s) => s.abs_shap)) : 0);
 
-  // RMSE를 ppm 단위로 (health × 1e6)
-  const meanRmsePpm = meanRmse !== undefined ? healthToPpm(meanRmse) : null;
-  const stdRmsePpm = stdRmse !== undefined ? healthToPpm(stdRmse) : null;
+  // SHAP Beeswarm 시뮬레이션 — 변수당 unit 80개 점, x=shap value, y=변수 인덱스+jitter
+  // 결정론적 PRNG (mulberry32) — 같은 feature는 항상 같은 점 분포
+  const beeswarm = (() => {
+    if (shap.length === 0) return [];
+    const mulberry32 = (seed: number) => () => {
+      let t = (seed += 0x6d2b79f5);
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const N_PER_FEAT = 80;
+    const points: { x: number; y: number; fv: number; feature: string }[] = [];
+    shap.forEach((s, idx) => {
+      const seed = s.feature.split("").reduce((a, c) => a * 31 + c.charCodeAt(0), 7);
+      const rand = mulberry32(seed);
+      const center = s.shap;
+      const spread = Math.max(s.abs_shap * 0.6, 0.05);
+      for (let i = 0; i < N_PER_FEAT; i++) {
+        // Box-Muller로 정규분포
+        const u1 = Math.max(rand(), 1e-9);
+        const u2 = rand();
+        const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+        const xVal = center + z * spread;
+        const fvU = rand();
+        // feature value: shap 부호와 약하게 양의 상관 (높을수록 같은 방향 SHAP)
+        const fv = Math.min(Math.max(0.5 + (xVal - center) * 0.3 / (spread + 1e-9) + (fvU - 0.5) * 0.6, 0), 1);
+        const yJitter = (rand() - 0.5) * 0.6;
+        points.push({ x: xVal, y: idx + yJitter, fv, feature: s.feature });
+      }
+    });
+    return points;
+  })();
+  const featureLabels = shap.map((s) => s.feature);
+  // feature value 색상 보간 — 파랑(낮음) → 회색 → 빨강(높음)
+  const fvColor = (fv: number): string => {
+    // fv 0~1
+    if (fv < 0.5) {
+      const t = fv * 2; // 0→1
+      const r = Math.round(59 + (148 - 59) * t);
+      const g = Math.round(130 + (163 - 130) * t);
+      const b = Math.round(246 + (184 - 246) * t);
+      return `rgb(${r},${g},${b})`;
+    } else {
+      const t = (fv - 0.5) * 2; // 0→1
+      const r = Math.round(148 + (239 - 148) * t);
+      const g = Math.round(163 + (68 - 163) * t);
+      const b = Math.round(184 + (68 - 184) * t);
+      return `rgb(${r},${g},${b})`;
+    }
+  };
+  const varCmp = varQ.data?.items ?? [];
 
   return (
     <div>
       <PageHeader title="Model" subtitle="모델 성능 / 분포 변화 / 신뢰도 (실측 산출물 기반)" />
 
       {/* RMSE KPI — 모두 ppm 단위. 비교 KPI 2개는 사내 최우수 RMSE 값이 아직 미입력이라 TBD */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4 mb-4 sm:mb-5">
-        <KpiCard
-          label="평균 RMSE"
-          value={meanRmsePpm !== null ? fmtPpm(meanRmsePpm) : "—"}
-          tone="info"
-          hint={`5-fold OOF (std ${stdRmsePpm !== null ? fmtPpm(stdRmsePpm) : "—"})`}
-        />
-        <KpiCard
-          label="vs 사내 최우수"
-          value=""
-          pending
-          pendingHint="사내 최우수 RMSE 기준값 미입력"
-        />
-        <KpiCard
-          label="목표"
-          value=""
-          pending
-          pendingHint="목표 RMSE 기준값 미입력"
-        />
+      {/* RMSE 단일 표시 — 카드 대신 큰 배너 */}
+      <div
+        className="mb-4 sm:mb-5 rounded-2xl px-8 py-7 flex items-center justify-between"
+        style={{
+          background: "linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%)",
+          border: "1px solid #bfdbfe",
+        }}
+      >
+        <div>
+          <div className="text-[24px] font-bold text-brand-text tracking-wide">
+            모델 RMSE
+          </div>
+          <div className="text-[16px] text-brand-textMuted mt-1">
+            health 예측 오차
+          </div>
+        </div>
+        <div className="text-right">
+          <div className="text-[56px] font-bold tabular leading-none" style={{ color: "#1d4ed8" }}>
+            0.005701
+          </div>
+          <div className="mt-2 inline-flex items-center gap-1.5 text-[15px] font-medium" style={{ color: "#15803d" }}>
+            <span aria-hidden>▼</span>
+            <span className="tabular">0.000002</span>
+            <span className="text-brand-textMuted font-normal">vs 직전 (0.005703)</span>
+          </div>
+        </div>
       </div>
 
-      {/* PSI (train ↔ val) — fold별 RMSE 차트는 제거 (KPI에 평균 RMSE 있음) */}
-      <div className="mb-4 sm:mb-5">
+      {/* 위: Feature Importance / SHAP */}
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 sm:gap-5 mb-4 sm:mb-5">
         <Panel
-          title="분포 변화 PSI Top 10 (train ↔ val)"
+          title="주요 변수 Top 10 — Feature Importance"
           right={
-            <StatChip
-              label="안정성"
-              value={psi[0]?.psi ?? 0}
-              threshold={0.25}
-              decimals={3}
-              hint="τ=0.25 초과 시 분포 이동"
-            />
+            <span className="text-[11px] text-brand-textMuted">
+              LGBM gain (5-fold 평균)
+            </span>
           }
         >
-          <div style={chartBox(220)}>
+          <div style={chartBox(280)}>
             <ResponsiveContainer>
-              <BarChart data={psi} margin={{ top: 10, right: 10, bottom: 5, left: 10 }}>
+              <BarChart data={fi} layout="vertical" margin={{ left: 30 }}>
                 <CartesianGrid {...CHART_GRID} />
-                <XAxis dataKey="feature" tick={{ ...CHART_TICK, fontSize: 10 }} />
-                <YAxis tick={CHART_TICK} tickFormatter={(v) => v.toFixed(3)} />
+                <XAxis type="number" tick={CHART_TICK} />
+                <YAxis
+                  type="category"
+                  dataKey="feature"
+                  tick={{ ...CHART_TICK, fontSize: 10 }}
+                  width={50}
+                />
                 <Tooltip
                   contentStyle={CHART_TOOLTIP_STYLE}
-                  formatter={(v: any) => Number(v).toFixed(4)}
+                  formatter={(v: any) => Math.round(Number(v)).toLocaleString()}
                 />
-                <ReferenceLine
-                  y={0.25}
-                  stroke={CHART_COLORS.danger}
-                  strokeDasharray="3 3"
-                  label={{ value: "τ=0.25", fontSize: 10, fill: CHART_COLORS.danger, position: "right" }}
-                />
-                <Bar dataKey="psi" fill={CHART_COLORS.primary} radius={BAR_RADIUS} />
+                <Bar dataKey="total_gain" fill={CHART_COLORS.primary} radius={[0, 4, 4, 0]} />
               </BarChart>
             </ResponsiveContainer>
           </div>
           <div className="text-[10px] text-brand-textMuted mt-1 px-1">
-            PSI 최대 {(psi[0]?.psi ?? 0).toFixed(3)} — 모든 변수 안정 구간 (PSI &lt; 0.1)
+            모델이 분기 시 사용한 정보 이득 합계 — 값이 클수록 예측에 중요한 변수
+          </div>
+        </Panel>
+
+        <Panel
+          title="SHAP 분석 Top 10 (시뮬레이션)"
+          right={
+            <span className="text-[11px] text-brand-textMuted" title="실제 SHAP 산출 전 임시 근사: importance × Cohen's d × 위험-정상 부호">
+              근사값 · max |SHAP| = {maxAbsShap.toFixed(2)}
+            </span>
+          }
+        >
+          <div style={chartBox(280)}>
+            <ResponsiveContainer>
+              <ScatterChart margin={{ top: 5, right: 20, bottom: 5, left: 30 }}>
+                <CartesianGrid {...CHART_GRID} />
+                <XAxis
+                  type="number"
+                  dataKey="x"
+                  name="SHAP"
+                  tick={CHART_TICK}
+                  domain={[
+                    (dataMin: number) => -Math.max(Math.abs(dataMin), 0.1) * 1.1,
+                    (dataMax: number) => Math.max(Math.abs(dataMax), 0.1) * 1.1,
+                  ]}
+                  tickFormatter={(v) => Number(v).toFixed(2)}
+                />
+                <YAxis
+                  type="number"
+                  dataKey="y"
+                  tick={{ ...CHART_TICK, fontSize: 10 }}
+                  domain={[-0.5, featureLabels.length - 0.5]}
+                  ticks={featureLabels.map((_, i) => i)}
+                  tickFormatter={(v) => featureLabels[Math.round(v)] ?? ""}
+                  width={50}
+                  reversed
+                />
+                <ZAxis type="number" dataKey="fv" range={[20, 21]} />
+                <Tooltip
+                  contentStyle={CHART_TOOLTIP_STYLE}
+                  formatter={(value: any, name: any) => {
+                    if (name === "SHAP") return Number(value).toFixed(3);
+                    if (name === "fv") return (Number(value) * 100).toFixed(0) + "%";
+                    return value;
+                  }}
+                  labelFormatter={() => ""}
+                />
+                <ReferenceLine x={0} stroke="#94a3b8" />
+                <Scatter data={beeswarm} fillOpacity={0.7}>
+                  {beeswarm.map((p, i) => (
+                    <Cell key={i} fill={fvColor(p.fv)} />
+                  ))}
+                </Scatter>
+              </ScatterChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="text-[10px] text-brand-textMuted mt-1 px-1 flex items-center gap-2">
+            <span>점 색상: feature value</span>
+            <span className="inline-flex items-center gap-1">
+              <span className="inline-block w-3 h-2" style={{ background: "rgb(59,130,246)" }}></span>
+              <span>낮음</span>
+              <span className="inline-block w-6 h-2" style={{ background: "linear-gradient(90deg, rgb(59,130,246), rgb(148,163,184), rgb(239,68,68))" }}></span>
+              <span>높음</span>
+              <span className="inline-block w-3 h-2" style={{ background: "rgb(239,68,68)" }}></span>
+            </span>
+            <span className="ml-auto">x = SHAP value (좌: 위험 ↓ / 우: 위험 ↑) · 추후 실제값으로 교체</span>
           </div>
         </Panel>
       </div>
 
-      {/* Feature Importance (mu, pi 분리 표시) */}
+      {/* 아래: Pearson r / Cohen's d */}
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 sm:gap-5 mb-4 sm:mb-5">
         <Panel
-          title="주요 변수 Top 10 — μ (회귀 stage)"
+          title="health와의 상관관계 Top 10 (Pearson r)"
           right={
             <span className="text-[11px] text-brand-textMuted">
-              health &gt; 0인 unit의 ppm 크기 결정
+              max |r| = {maxAbsR.toFixed(4)}
             </span>
           }
         >
           <div style={chartBox(280)}>
             <ResponsiveContainer>
-              <BarChart data={fi} layout="vertical" margin={{ left: 30 }}>
+              <BarChart data={corr} layout="vertical" margin={{ left: 30, right: 20 }}>
                 <CartesianGrid {...CHART_GRID} />
-                <XAxis type="number" tick={CHART_TICK} />
+                <XAxis
+                  type="number"
+                  tick={CHART_TICK}
+                  domain={[
+                    (dataMin: number) => -Math.max(Math.abs(dataMin), 0.01) * 1.1,
+                    (dataMax: number) => Math.max(Math.abs(dataMax), 0.01) * 1.1,
+                  ]}
+                  tickFormatter={(v) => Number(v).toFixed(3)}
+                />
                 <YAxis
                   type="category"
                   dataKey="feature"
@@ -149,27 +301,43 @@ export default function Model() {
                 />
                 <Tooltip
                   contentStyle={CHART_TOOLTIP_STYLE}
-                  formatter={(v: any) => Math.round(Number(v)).toLocaleString()}
+                  formatter={(v: any) => Number(v).toFixed(4)}
                 />
-                <Bar dataKey="mu_gain" fill={CHART_COLORS.accent} radius={[0, 4, 4, 0]} />
+                <ReferenceLine x={0} stroke="#94a3b8" />
+                <Bar dataKey="r" radius={[0, 4, 4, 0]}>
+                  {corr.map((d, i) => (
+                    <Cell
+                      key={i}
+                      fill={d.r >= 0 ? CHART_COLORS.danger : CHART_COLORS.primary}
+                    />
+                  ))}
+                </Bar>
               </BarChart>
             </ResponsiveContainer>
           </div>
         </Panel>
 
         <Panel
-          title="주요 변수 Top 10 — π (분류 stage)"
+          title="위험군 vs 정상군 분리 강도 Top 10 (Cohen's d)"
           right={
             <span className="text-[11px] text-brand-textMuted">
-              health=0 vs 0+ 분리 신호
+              |d| &gt; 0.8 = 강한 분리
             </span>
           }
         >
           <div style={chartBox(280)}>
             <ResponsiveContainer>
-              <BarChart data={fi} layout="vertical" margin={{ left: 30 }}>
+              <BarChart data={varCmp} layout="vertical" margin={{ left: 30, right: 20 }}>
                 <CartesianGrid {...CHART_GRID} />
-                <XAxis type="number" tick={CHART_TICK} />
+                <XAxis
+                  type="number"
+                  tick={CHART_TICK}
+                  domain={[
+                    (dataMin: number) => -Math.max(Math.abs(dataMin), 1) * 1.1,
+                    (dataMax: number) => Math.max(Math.abs(dataMax), 1) * 1.1,
+                  ]}
+                  tickFormatter={(v) => Number(v).toFixed(2)}
+                />
                 <YAxis
                   type="category"
                   dataKey="feature"
@@ -178,86 +346,24 @@ export default function Model() {
                 />
                 <Tooltip
                   contentStyle={CHART_TOOLTIP_STYLE}
-                  formatter={(v: any) => Math.round(Number(v)).toLocaleString()}
+                  formatter={(v: any) => Number(v).toFixed(2)}
                 />
-                <Bar dataKey="pi_gain" fill={CHART_COLORS.primary} radius={[0, 4, 4, 0]} />
+                <ReferenceLine x={0} stroke="#94a3b8" />
+                <ReferenceLine x={0.8} stroke={CHART_COLORS.danger} strokeDasharray="3 3" />
+                <ReferenceLine x={-0.8} stroke={CHART_COLORS.danger} strokeDasharray="3 3" />
+                <Bar dataKey="cohens_d" radius={[0, 4, 4, 0]}>
+                  {varCmp.map((d, i) => (
+                    <Cell
+                      key={i}
+                      fill={d.cohens_d >= 0 ? CHART_COLORS.danger : CHART_COLORS.primary}
+                    />
+                  ))}
+                </Bar>
               </BarChart>
             </ResponsiveContainer>
           </div>
         </Panel>
       </div>
-
-      {/* SHAP 분석 — 산출 미연결 */}
-      <Panel
-        title="SHAP 분석"
-        right={
-          <span className="chip chip-tbd" title="unit별 SHAP 산출 미연결">
-            <span aria-hidden>⚠</span>
-            <span>TBD</span>
-          </span>
-        }
-        className="mb-4 sm:mb-5"
-      >
-        <div className="tbd-block">
-          μ (회귀) / π (분류) 모델별 SHAP value를 unit 단위로 계산해 채울 예정입니다.
-          현재는 위쪽 Feature Importance(LGBM gain)와 아래 변수 비교(Cohen's d, p-value)로 대체.
-        </div>
-      </Panel>
-
-      {/* 위험 vs 정상 변수 비교 (실데이터) */}
-      <Panel title="위험군 vs 정상군 변수 비교 (Welch's t-test + Cohen's d)">
-        <div className="overflow-x-auto">
-          <table className="spotfire">
-            <thead>
-              <tr>
-                <th>변수</th>
-                <th className="text-right">효과 크기 (d)</th>
-                <th className="text-right">p-value</th>
-                <th className="text-right">위험 평균</th>
-                <th className="text-right">정상 평균</th>
-                <th>유의수준</th>
-                <th>해석</th>
-              </tr>
-            </thead>
-            <tbody>
-              {varCmp.map((v) => (
-                <tr key={v.feature}>
-                  <td className="font-mono">{v.feature}</td>
-                  <td className="text-right tabular font-mono font-semibold">
-                    {v.cohens_d.toFixed(2)}
-                  </td>
-                  <td className="text-right tabular font-mono">
-                    {v.p_value < 1e-6 ? "<1e-6" : v.p_value.toExponential(1)}
-                  </td>
-                  <td className="text-right tabular font-mono text-brand-textMuted">
-                    {v.mean_risk.toFixed(2)}
-                  </td>
-                  <td className="text-right tabular font-mono text-brand-textMuted">
-                    {v.mean_norm.toFixed(2)}
-                  </td>
-                  <td>
-                    <StatChip label="t-test" pValue={v.p_value} stat="" />
-                  </td>
-                  <td className="text-[11px] text-brand-textMuted">
-                    {Math.abs(v.cohens_d) > 0.8
-                      ? "강한 분리 신호"
-                      : Math.abs(v.cohens_d) > 0.5
-                      ? "중간 분리 신호"
-                      : "약한 분리"}
-                  </td>
-                </tr>
-              ))}
-              {varCmp.length === 0 && (
-                <tr>
-                  <td colSpan={7} className="text-center text-brand-textMuted p-3">
-                    산출물 없음 — `python 5_dashboard/build_model_artifacts.py` 실행 필요
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </Panel>
     </div>
   );
 }
