@@ -2,16 +2,16 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { fetchTriage } from "../lib/api";
-import { fmtNum, fmtPct } from "../lib/format";
+import { fmtPpm, healthToPpm } from "../lib/format";
 
 export default function NotificationBell() {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
-  // test split 기준 위험 항목으로 알림 구성 (실제로는 polling 또는 WS로 대체).
+  // 오늘 검사된 위험 항목으로 알림 구성 — PI가 가장 먼저 봐야 하는 것
   const { data } = useQuery({
-    queryKey: ["alerts-triage"],
-    queryFn: () => fetchTriage({ split: "test", top_units: 5, top_wafers: 5 }),
+    queryKey: ["alerts-today"],
+    queryFn: () => fetchTriage({ status: "today", top_units: 5, top_wafers: 5 }),
   });
 
   useEffect(() => {
@@ -47,9 +47,9 @@ export default function NotificationBell() {
         <div className="absolute right-0 top-11 w-96 bg-white rounded-lg shadow-cardHover border border-brand-border z-50 overflow-hidden">
           <div className="px-4 py-3 border-b border-brand-border bg-brand-subtle flex items-center justify-between">
             <div>
-              <div className="text-[13px] font-semibold text-brand-text">알림</div>
+              <div className="text-[13px] font-semibold text-brand-text">오늘 알림</div>
               <div className="text-[11px] text-brand-textMuted">
-                새로 감지된 위험 wafer / unit
+                오늘 검사된 위험 항목
               </div>
             </div>
             <span className="text-[11px] text-brand-textMuted">
@@ -66,7 +66,7 @@ export default function NotificationBell() {
                 {wafers.map((w) => (
                   <Link
                     key={w.wafer_key}
-                    to={`/wafers?key=${encodeURIComponent(w.wafer_key)}`}
+                    to={`/drilldown?key=${encodeURIComponent(w.wafer_key)}`}
                     onClick={() => setOpen(false)}
                     className="block px-4 py-2.5 hover:bg-brand-subtle border-b border-brand-border/50"
                   >
@@ -77,9 +77,9 @@ export default function NotificationBell() {
                           {w.wafer_key}
                         </div>
                         <div className="text-[11px] text-brand-textMuted mt-0.5">
-                          위험률 <span className="font-bold text-brand-danger">{fmtPct(w.risk_ratio)}</span>
+                          평균 <span className="font-bold text-brand-danger">{fmtPpm(healthToPpm(w.mean_pred))}</span>
                           {" · "}
-                          {w.n_risk}/{w.n_units} units
+                          임계 초과 {w.n_risk}/{w.n_units}
                         </div>
                       </div>
                     </div>
@@ -96,7 +96,7 @@ export default function NotificationBell() {
                 {units.map((u) => (
                   <Link
                     key={u.ufs_serial}
-                    to={`/wafers?key=${encodeURIComponent(u.wafer_key)}`}
+                    to={`/drilldown?key=${encodeURIComponent(u.wafer_key)}`}
                     onClick={() => setOpen(false)}
                     className="block px-4 py-2.5 hover:bg-brand-subtle border-b border-brand-border/50"
                   >
@@ -107,7 +107,7 @@ export default function NotificationBell() {
                           {u.ufs_serial}
                         </div>
                         <div className="text-[11px] text-brand-textMuted mt-0.5">
-                          pred <span className="font-bold text-brand-danger">{fmtNum(u.pred)}</span>
+                          예측 <span className="font-bold text-brand-danger">{fmtPpm(healthToPpm(u.pred))}</span>
                           {" · "}
                           <span className="font-mono">{u.wafer_key}</span>
                         </div>

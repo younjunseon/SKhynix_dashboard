@@ -25,12 +25,16 @@ PROJECT_ROOT = os.path.dirname(HERE)
 sys.path.insert(0, PROJECT_ROOT)
 
 SRC_DIR = os.path.join(PROJECT_ROOT, "4_output", "final", "zit_only")
+XS_PATH = os.path.join(PROJECT_ROOT, "0_data", "compet_xs_data.csv")
 OUT_DIR = os.path.join(HERE, "data")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # 위험도 기준: 절대 임계값이 아닌 pred 상위 비율로 정의
 # (ZITboost pred는 분포가 좁아 절대 threshold가 의미 없음)
 RISK_TOP_RATIO = 0.05  # 상위 5%
+
+# 정상 baseline = 위험률(평균 pred) 하위 50% wafer
+NORMAL_BASELINE_RATIO = 0.5
 
 
 def load_split(split: str) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -137,20 +141,50 @@ def main():
             "health_zero_ratio": float((sub["health"] == 0).mean()),
         }
 
+    # ─── [5/5] unit 단위 feature 평균 + 정상 unit baseline ───
+    print("[5/5] unit feature 집계 + 정상 unit baseline 산출")
+    print(f"  원본 X 로드: {XS_PATH}")
+    xs = pd.read_csv(XS_PATH)
+    feat_cols = [c for c in xs.columns if c.startswith("X")]
+    print(f"  X feature 수: {len(feat_cols)}, die 수: {len(xs):,}")
+
+    # unit 단위 feature 평균 (43,745 unit × 1,087 feature, 한 unit = die 4개 평균)
+    unit_features = xs.groupby("ufs_serial")[feat_cols].mean().reset_index()
+    print(f"  unit feature 매트릭스: {unit_features.shape}")
+
+    # 정상 baseline: 평균 pred 하위 50% unit 선정
+    threshold = unit_all["pred"].quantile(NORMAL_BASELINE_RATIO)
+    normal_serials = set(unit_all.loc[unit_all["pred"] <= threshold, "ufs_serial"])
+    normal_features = unit_features[unit_features["ufs_serial"].isin(normal_serials)]
+    print(f"  정상 unit (pred 하위 {NORMAL_BASELINE_RATIO*100:.0f}%): {len(normal_serials):,}개")
+
+    # feature별 정상 mean / std → baseline.parquet
+    normal_baseline = pd.DataFrame({
+        "feature": feat_cols,
+        "normal_mean": normal_features[feat_cols].mean().values,
+        "normal_std": normal_features[feat_cols].std().values,
+    })
+    # std=0인 feature는 z-score 무한대 방지를 위해 1e-9로 대체
+    normal_baseline.loc[normal_baseline["normal_std"] < 1e-9, "normal_std"] = 1e-9
+
     # ─── 저장 ──────────────────────────────────────────────
     die_path = os.path.join(OUT_DIR, "die_predictions.parquet")
     unit_path = os.path.join(OUT_DIR, "unit_predictions.parquet")
     wafer_path = os.path.join(OUT_DIR, "wafer_summary.parquet")
+    unit_feat_path = os.path.join(OUT_DIR, "unit_features.parquet")
+    baseline_path = os.path.join(OUT_DIR, "normal_baseline.parquet")
     stats_path = os.path.join(OUT_DIR, "overview_stats.json")
 
     die_all.to_parquet(die_path, index=False)
     unit_all.to_parquet(unit_path, index=False)
     wafer_summary.to_parquet(wafer_path, index=False)
+    unit_features.to_parquet(unit_feat_path, index=False)
+    normal_baseline.to_parquet(baseline_path, index=False)
     with open(stats_path, "w", encoding="utf-8") as f:
         json.dump(overview, f, indent=2, ensure_ascii=False)
 
     print("\n저장 완료:")
-    for p in [die_path, unit_path, wafer_path, stats_path]:
+    for p in [die_path, unit_path, wafer_path, unit_feat_path, baseline_path, stats_path]:
         size_mb = os.path.getsize(p) / 1024 / 1024
         print(f"  {os.path.relpath(p, PROJECT_ROOT)}  ({size_mb:.2f} MB)")
 

@@ -7,25 +7,27 @@ interface Message {
 }
 
 const SUGGESTIONS = [
-  "오늘 가장 위험한 wafer는?",
-  "예측 불량률 추이 알려줘",
-  "지난 주 대비 변화는?",
-  "Top 10 위험 unit 보여줘",
+  "오늘 위험 wafer 알려줘",
+  "최근 불량률 추이는?",
+  "어떤 변수가 문제야?",
+  "위험 unit 목록",
 ];
 
 function botReply(input: string): string {
-  // 임시 mock 응답 — 추후 LLM API로 교체
   const text = input.toLowerCase();
   if (text.includes("위험") && text.includes("wafer")) {
-    return "현재 split=test 기준 위험률 상위 wafer는 좌측 사이드바 → Wafer Map 탭의 목록 최상단을 확인하세요. 위험 wafer 카드 클릭 시 die 단위 히트맵으로 drill-down 됩니다.";
+    return "Drill-down 탭에서 lot/wafer 트리 상단을 보세요. wafer 선택 시 die 위치와 주요 기여 변수가 함께 표시됩니다.";
   }
   if (text.includes("불량률") || text.includes("추이")) {
-    return "Overview 페이지의 듀얼축 차트에서 일/주/월 단위 완료수량과 불량률을 함께 볼 수 있습니다. train(실측) 막대와 val·test(예측) 막대가 색으로 구분됩니다.";
+    return "Overview 시계열 차트에서 일/주/월 단위 추이를 확인할 수 있습니다. 추세 검정 결과는 차트 우측 상단 칩에 표시됩니다.";
+  }
+  if (text.includes("변수") || text.includes("문제")) {
+    return "Drill-down에서 unit 선택 시 우측 패널에 주요 기여 변수 Top 20과 z-score가 표시됩니다. 전반적인 변수 영향력은 Model 탭에서 확인 가능합니다.";
   }
   if (text.includes("unit")) {
-    return "Data 페이지에서 split·검색·정렬을 적용해 unit 단위 데이터를 확인할 수 있고, '위험 unit만' 토글로 필터링도 가능합니다. 행의 wafer를 클릭하면 해당 wafer 진단 페이지로 이동합니다.";
+    return "Data 탭에서 status·검색·정렬로 unit을 조회할 수 있습니다.";
   }
-  return "아직 학습 중인 질문이에요. AI Agent는 추후 LLM과 연동되어 데이터 질의·요약·근거 피처(SHAP) 분석까지 답변할 예정입니다.";
+  return "준비 중입니다. 이후 데이터 질의와 변수 근거 분석까지 응답하도록 확장 예정입니다.";
 }
 
 export default function ChatbotWidget() {
@@ -34,7 +36,7 @@ export default function ChatbotWidget() {
   const [messages, setMessages] = useState<Message[]>([
     {
       role: "bot",
-      text: "안녕하세요! Wafer Health AI Agent입니다. 위험 wafer/unit, 불량률 추이, 데이터 검색 등을 물어보세요.",
+      text: "무엇을 도와드릴까요?",
       ts: Date.now(),
     },
   ]);
@@ -63,10 +65,10 @@ export default function ChatbotWidget() {
       {/* 플로팅 버튼 */}
       <button
         onClick={() => setOpen((v) => !v)}
-        className="fixed bottom-6 right-6 w-14 h-14 rounded-full text-white flex items-center justify-center transition-all hover:scale-105 z-40"
+        className="fixed bottom-4 right-4 xl:bottom-6 xl:right-6 w-11 h-11 xl:w-12 xl:h-12 rounded-full text-white flex items-center justify-center transition-all hover:scale-105 z-40"
         style={{
-          background: "linear-gradient(135deg, #4c1d95 0%, #7c3aed 100%)",
-          boxShadow: "0 8px 24px rgba(76, 29, 149, 0.35)",
+          background: "linear-gradient(135deg, #2563eb 0%, #3b82f6 100%)",
+          boxShadow: "0 6px 20px rgba(37, 99, 235, 0.35)",
         }}
         aria-label="챗봇 열기"
       >
@@ -84,13 +86,13 @@ export default function ChatbotWidget() {
       {/* 챗봇 패널 */}
       {open && (
         <div
-          className="fixed bottom-24 right-6 w-[380px] h-[540px] bg-white rounded-2xl shadow-cardHover border border-brand-border z-40 flex flex-col overflow-hidden"
+          className="fixed bottom-20 right-6 w-[360px] h-[520px] bg-white rounded-2xl shadow-cardHover border border-brand-border z-40 flex flex-col overflow-hidden"
           style={{ boxShadow: "0 12px 40px rgba(15, 23, 42, 0.18)" }}
         >
           {/* 헤더 */}
           <div
             className="px-4 py-3 text-white flex items-center gap-3"
-            style={{ background: "linear-gradient(135deg, #4c1d95 0%, #2e1065 100%)" }}
+            style={{ background: "linear-gradient(135deg, #2563eb 0%, #3b82f6 100%)" }}
           >
             <div className="w-9 h-9 rounded-full bg-white/15 ring-2 ring-white/20 flex items-center justify-center">
               <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -98,7 +100,7 @@ export default function ChatbotWidget() {
               </svg>
             </div>
             <div className="flex-1 min-w-0">
-              <div className="font-semibold text-[14px]">Wafer AI Agent</div>
+              <div className="font-semibold text-[14px]">Assistant</div>
               <div className="text-[11px] text-white/70 flex items-center gap-1">
                 <span className="inline-block w-1.5 h-1.5 rounded-full bg-brand-success"></span>
                 온라인

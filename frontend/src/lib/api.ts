@@ -5,21 +5,29 @@ export const api = axios.create({
   timeout: 15000,
 });
 
-export type Split = "oof" | "val" | "test";
+/**
+ * Status — PI 운영 관점 unit 분류.
+ * - completed : health 실측 끝난 unit (어제까지 검사 완료)
+ * - pending   : WT 끝났지만 health 미측정 (예측만 있음)
+ * - today     : 오늘 검사된 unit (가장 강조 — 의사결정 우선)
+ */
+export type Status = "completed" | "pending" | "today";
+/** 필터 값: "all"은 전체 표시 */
+export type StatusFilter = Status | "all";
 
-export interface SplitStats {
+export interface StatusStats {
   n_units: number;
-  rmse: number;
   n_risk: number;
   risk_ratio: number;
   pred_mean: number;
   pred_max: number;
   health_zero_ratio: number;
+  rmse?: number;  // completed에만 있음 (실측 health 있어야 계산 가능)
 }
 
 export interface Overview {
   risk_top_ratio: number;
-  splits: Record<Split, SplitStats>;
+  statuses: Record<Status, StatusStats>;
   totals: { n_units: number; n_dies: number; n_wafers: number };
 }
 
@@ -27,7 +35,7 @@ export interface WaferSummary {
   wafer_key: string;
   run_id: string;
   wafer_no: string;
-  split: Split;
+  status: Status;
   n_units: number;
   mean_pred: number;
   max_pred: number;
@@ -40,7 +48,8 @@ export interface UnitItem {
   ufs_serial: string;
   pred: number;
   health: number;
-  split: Split;
+  status: Status;
+  inspected_date: string;  // ISO date "YYYY-MM-DD"
   run_id: string;
   wafer_no: string;
   wafer_key: string;
@@ -59,14 +68,66 @@ export interface DieItem {
   pred: number;
   health?: number;
   ufs_serial?: string;
-  split?: Split;
+  status?: Status;
 }
 
 export const fetchOverview = () =>
   api.get<Overview>("/api/overview").then((r) => r.data);
 
+export interface WaferGrid {
+  bounds: { x_min: number; x_max: number; y_min: number; y_max: number };
+  width: number;
+  height: number;
+  /** 모든 wafer를 겹친 unique (die_x, die_y) 좌표 — wafer 진짜 외형 */
+  mask: [number, number][];
+}
+
+export const fetchWaferGrid = () =>
+  api.get<WaferGrid>("/api/wafer-grid").then((r) => r.data);
+
+export interface AnomalyFeature {
+  feature: string;
+  unit_value: number;
+  normal_mean: number;
+  normal_std: number;
+  z_score: number;
+}
+
+export interface AnomalyFeaturesResponse {
+  ufs_serial: string;
+  top_n: number;
+  items: AnomalyFeature[];
+}
+
+export const fetchUnitAnomalyFeatures = (ufsSerial: string, topN: number = 10) =>
+  api
+    .get<AnomalyFeaturesResponse>(`/api/units/${ufsSerial}/anomaly_features`, {
+      params: { top_n: topN },
+    })
+    .then((r) => r.data);
+
+export interface GlobalAnomalyItem {
+  feature: string;
+  risk_mean: number;
+  normal_mean: number;
+  normal_std: number;
+  z_score: number;
+}
+
+export interface GlobalAnomalyResponse {
+  status: string;
+  n_risk_units: number;
+  top_n: number;
+  items: GlobalAnomalyItem[];
+}
+
+export const fetchGlobalAnomalyFeatures = (params: { status?: StatusFilter; top_n?: number }) =>
+  api
+    .get<GlobalAnomalyResponse>("/api/anomaly_features_global", { params })
+    .then((r) => r.data);
+
 export const fetchWafers = (params: {
-  split?: Split;
+  status?: StatusFilter;
   sort?: string;
   limit?: number;
 }) =>
@@ -85,7 +146,7 @@ export const fetchWaferDetail = (waferKey: string) =>
     .then((r) => r.data);
 
 export const fetchUnits = (params: {
-  split?: Split;
+  status?: StatusFilter;
   risk_only?: boolean;
   sort?: string;
   order?: "asc" | "desc";
@@ -122,7 +183,7 @@ export interface ScaleInfo {
 }
 
 export interface TriageResponse {
-  split: Split;
+  status: StatusFilter;
   summary: TriageSummary;
   scale: ScaleInfo;
   top_wafers: WaferSummary[];
@@ -142,7 +203,7 @@ export interface LotItem {
 }
 
 export interface LotsResponse {
-  split: Split;
+  status: StatusFilter;
   baseline_risk_ratio: number;
   n_lots_total: number;
   items: LotItem[];
@@ -150,7 +211,7 @@ export interface LotsResponse {
 
 export interface LotDetail {
   run_id: string;
-  split: Split;
+  status: StatusFilter;
   summary: {
     n_units: number;
     n_wafers: number;
@@ -170,14 +231,28 @@ export interface LotDetail {
   }[];
 }
 
-export const fetchLots = (params: { split?: Split; sort?: string; limit?: number }) =>
+export const fetchLots = (params: { status?: StatusFilter; sort?: string; limit?: number }) =>
   api.get<LotsResponse>("/api/lots", { params }).then((r) => r.data);
 
-export const fetchLotDetail = (runId: string, split: Split) =>
-  api.get<LotDetail>(`/api/lots/${runId}`, { params: { split } }).then((r) => r.data);
+export const fetchLotDetail = (runId: string, status: StatusFilter) =>
+  api.get<LotDetail>(`/api/lots/${runId}`, { params: { status } }).then((r) => r.data);
+
+export interface LotMap {
+  run_id: string;
+  agg: "mean" | "max";
+  n_wafers: number;
+  n_dies_total: number;
+  n_unique_positions: number;
+  dies: DieItem[];
+}
+
+export const fetchLotMap = (runId: string, params: { status?: StatusFilter; agg?: "mean" | "max" } = {}) =>
+  api
+    .get<LotMap>(`/api/lots/${runId}/aggregate-map`, { params })
+    .then((r) => r.data);
 
 export const fetchTriage = (params: {
-  split?: Split;
+  status?: StatusFilter;
   top_units?: number;
   top_wafers?: number;
   unit_cost?: number;
@@ -190,7 +265,8 @@ export interface UnitReport {
   is_risk: boolean;
   pred: number;
   health: number | null;
-  split: Split;
+  status: Status;
+  inspected_date: string;
   wafer_key: string;
   pred_rank: number;
   threshold: number;
@@ -210,4 +286,64 @@ export interface UnitReport {
 export const fetchUnitReport = (ufsSerial: string) =>
   api
     .get<UnitReport>(`/api/units/${ufsSerial}/report`)
+    .then((r) => r.data);
+
+
+/* ─── Model 산출물 (build_model_artifacts.py) ─────────────── */
+export interface FoldMetric {
+  fold: number;
+  rmse: number;
+  n_units: number;
+}
+
+export interface FoldMetrics {
+  n_folds: number;
+  seed: number;
+  folds: FoldMetric[];
+  mean_rmse: number;
+  std_rmse: number;
+  n_total_units: number;
+}
+
+export const fetchFoldMetrics = () =>
+  api.get<FoldMetrics>("/api/model/fold-metrics").then((r) => r.data);
+
+export interface FeatureImportance {
+  feature: string;
+  mu_gain: number;
+  pi_gain: number;
+  total_gain: number;
+}
+
+export const fetchFeatureImportance = (top = 10) =>
+  api
+    .get<{ items: FeatureImportance[]; n_total: number }>(
+      "/api/model/feature-importance",
+      { params: { top } },
+    )
+    .then((r) => r.data);
+
+export interface PsiItem {
+  feature: string;
+  psi: number;
+}
+
+export const fetchPsi = (top = 10) =>
+  api
+    .get<{ items: PsiItem[] }>("/api/model/psi", { params: { top } })
+    .then((r) => r.data);
+
+export interface VarCompareItem {
+  feature: string;
+  cohens_d: number;
+  p_value: number;
+  mean_risk: number;
+  mean_norm: number;
+  n_risk: number;
+  n_norm: number;
+}
+
+export const fetchVarCompare = (top = 10) =>
+  api
+    .get<{ items: VarCompareItem[] }>("/api/model/var-compare", { params: { top } })
     .then((r) => r.data);

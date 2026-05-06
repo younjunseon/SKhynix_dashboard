@@ -5,39 +5,45 @@ export default {
     extend: {
       colors: {
         brand: {
-          // 새 보라 팔레트 (사이드바 잘 보이는 deep purple + 라벤더 포인트)
-          primary: "#4c1d95",        // 사이드바 메인 (진한 보라)
-          primaryDark: "#2e1065",    // 사이드바 그라데이션 끝
-          primaryLight: "#7c3aed",   // hover, 강조 라인
-          accent: "#a78bfa",         // 보조 차트 (라벤더)
-          accentSoft: "#c4b5fd",     // 더 옅은 라벤더
-          mint: "#5eead4",           // 도넛 콘트라스트용
+          // Primary: Indigo/Blue (이전 보라 폐기)
+          primary: "#3b82f6",        // blue-500 — 메인 액센트
+          primaryDark: "#2563eb",    // blue-600 — hover
+          primaryLight: "#60a5fa",   // blue-400
+          accent: "#06b6d4",         // cyan-500 — 강조 보조
+          accentSoft: "#67e8f9",     // cyan-300
+          // 메뉴 dot 인디케이터용 (메뉴별 다른 색)
+          dot1: "#3b82f6",           // blue
+          dot2: "#06b6d4",           // cyan
+          dot3: "#f59e0b",           // amber
+          dot4: "#10b981",           // emerald
+          // 베이스
           surface: "#ffffff",
-          bg: "#f1f3f9",             // 본문 배경 (살짝 푸른 회색)
-          subtle: "#f7f8fc",
-          border: "#e2e8f0",
-          text: "#1a202c",
-          textMuted: "#64748b",
-          danger: "#e53e3e",
+          bg: "#fafafa",             // 거의 white-on-white
+          subtle: "#f8fafc",
+          border: "#eef2f7",         // 매우 옅게
+          borderStrong: "#e2e8f0",
+          text: "#0f172a",           // slate-900
+          textMuted: "#64748b",      // slate-500
+          // 상태
+          danger: "#ef4444",
           warn: "#f59e0b",
           success: "#10b981",
-          link: "#7c3aed",
-          // 호환용 (기존 코드 깨지지 않게)
-          navy: "#4c1d95",
-          navyDark: "#2e1065",
+          info: "#3b82f6",
+          link: "#3b82f6",
         },
+        // 호환용 sf — 기존 코드 깨지지 않게 유지 (점진 폐기)
         sf: {
-          bg: "#f1f3f9",
+          bg: "#fafafa",
           panel: "#ffffff",
-          border: "#e2e8f0",
-          softBorder: "#e2e8f0",
-          headBg: "#f7f8fc",
-          rowHover: "#f5f3ff",
-          select: "#4c1d95",
-          link: "#7c3aed",
-          magenta: "#d70073",
-          blue: "#4c1d95",
-          danger: "#e53e3e",
+          border: "#eef2f7",
+          softBorder: "#eef2f7",
+          headBg: "#f8fafc",
+          rowHover: "#eff6ff",
+          select: "#3b82f6",
+          link: "#3b82f6",
+          magenta: "#3b82f6",
+          blue: "#3b82f6",
+          danger: "#ef4444",
           warn: "#f59e0b",
         },
       },
@@ -46,8 +52,12 @@ export default {
         mono: ["Consolas", "Courier New", "monospace"],
       },
       boxShadow: {
-        card: "0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04)",
+        card: "0 1px 2px rgba(15, 23, 42, 0.04)",
         cardHover: "0 4px 12px rgba(15, 23, 42, 0.08)",
+        soft: "0 1px 3px rgba(15, 23, 42, 0.06)",
+      },
+      borderRadius: {
+        DEFAULT: "8px",
       },
     },
   },
